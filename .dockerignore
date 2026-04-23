@@ -1,0 +1,7 @@
+.git
+target
+artifacts
+bin
+*.docx
+*.log
+.DS_Store

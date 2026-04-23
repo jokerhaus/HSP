@@ -1,0 +1,14 @@
+FROM rust:1-bookworm AS builder
+
+WORKDIR /workspace
+COPY . .
+RUN rm -f rust-toolchain.toml \
+    && cargo build --release --locked -p hsp-s3
+
+FROM debian:bookworm-slim
+
+COPY --from=builder /workspace/target/release/hsp-s3 /usr/local/bin/hsp-s3
+
+USER 10001:10001
+EXPOSE 8081
+ENTRYPOINT ["/usr/local/bin/hsp-s3"]
