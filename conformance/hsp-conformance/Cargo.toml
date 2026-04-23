@@ -1,0 +1,34 @@
+[package]
+name = "hsp-conformance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+hsp-gw = { path = "../../gateway/hsp-gw" }
+hsp-s3 = { path = "../../server/hsp-s3" }
+hsp-cdn = { path = "../../gateway/hsp-cdn" }
+hspd = { path = "../../server/hspd" }
+hsp-auth = { path = "../../crates/hsp-auth" }
+hsp-core = { path = "../../crates/hsp-core" }
+hsp-crypto = { path = "../../crates/hsp-crypto" }
+hsp-distribution = { path = "../../crates/hsp-distribution" }
+hsp-path = { path = "../../crates/hsp-path" }
+hsp-service = { path = "../../crates/hsp-service" }
+hsp-wire = { path = "../../crates/hsp-wire" }
+base64.workspace = true
+bytes.workspace = true
+ciborium.workspace = true
+coset.workspace = true
+ed25519-dalek.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+hmac.workspace = true
+http.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["http2", "rustls-tls"] }
+sha2.workspace = true

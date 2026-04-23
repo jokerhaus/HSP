@@ -1,0 +1,15 @@
+[package]
+name = "hsp-wire"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bytes.workspace = true
+ciborium.workspace = true
+hsp-core = { path = "../hsp-core" }
+serde.workspace = true
+tokio.workspace = true

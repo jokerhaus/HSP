@@ -1,0 +1,44 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hsp-object-lock-worker
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: hsp-object-lock-worker
+  template:
+    metadata:
+      labels:
+        app: hsp-object-lock-worker
+    spec:
+      serviceAccountName: hsp-object-lock-worker
+      containers:
+        - name: worker
+          image: ghcr.io/example/hsp/hsp-s3:0.1.0
+          args: ["worker", "object-lock"]
+          env:
+            - name: HSP_ROOT_DIR
+              value: /var/lib/hsp
+            - name: HSP_ISSUER_REGISTRY
+              value: /etc/hsp/issuer-registry.json
+          volumeMounts:
+            - name: hsp-data
+              mountPath: /var/lib/hsp
+            - name: hsp-config
+              mountPath: /etc/hsp
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: hsp-data
+          emptyDir: {}
+        - name: hsp-config
+          configMap:
+            name: hsp-config

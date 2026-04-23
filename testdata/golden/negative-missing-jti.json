@@ -1,0 +1,8 @@
+{
+  "name": "missing-jti-on-mutation",
+  "operation": "PUT_INIT",
+  "expected_error": {
+    "category": "auth",
+    "code": "missing_jti"
+  }
+}

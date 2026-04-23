@@ -1,0 +1,18 @@
+[package]
+name = "hsp-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+base64.workspace = true
+ciborium.workspace = true
+coset.workspace = true
+ed25519-dalek.workspace = true
+hsp-core = { path = "../hsp-core" }
+hsp-path = { path = "../hsp-path" }
+serde.workspace = true
+serde_json.workspace = true

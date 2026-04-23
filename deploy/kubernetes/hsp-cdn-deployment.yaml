@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hsp-cdn
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hsp-cdn
+  template:
+    metadata:
+      labels:
+        app: hsp-cdn
+    spec:
+      serviceAccountName: hsp-cdn
+      containers:
+        - name: hsp-cdn
+          image: ghcr.io/example/hsp/hsp-cdn:0.1.0
+          env:
+            - name: HSP_ROOT_DIR
+              value: /var/lib/hsp
+            - name: HSP_ISSUER_REGISTRY
+              value: /etc/hsp/issuer-registry.json
+            - name: HSP_KMS_URI
+              value: "kms://workload-identity/public-multi-tenant"
+          ports:
+            - containerPort: 8082
+          volumeMounts:
+            - name: hsp-data
+              mountPath: /var/lib/hsp
+            - name: hsp-config
+              mountPath: /etc/hsp
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: hsp-data
+          emptyDir: {}
+        - name: hsp-config
+          configMap:
+            name: hsp-config

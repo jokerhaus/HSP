@@ -1,0 +1,36 @@
+{
+  "version": 1,
+  "authority": "localhost",
+  "native": {
+    "alpn": "hsp/1",
+    "host": "localhost",
+    "port": 443
+  },
+  "gateway": {
+    "base_url": "https://localhost/v1/"
+  },
+  "e2ee_required": true,
+  "storage_encryption_required": true,
+  "crypto_suite": [
+    "Ed25519",
+    "COSE_Sign1",
+    "XChaCha20-Poly1305",
+    "AES-256-GCM",
+    "SHA-256"
+  ],
+  "key_wrapping_suite": "HPKE/X25519",
+  "tenant_isolation_profile": "strict-per-tenant-key-domain",
+  "supported_token_profiles": [
+    "cose-sign1"
+  ],
+  "supported_extensions": [
+    "encrypted-store-alpha"
+  ],
+  "limits_revision": 1,
+  "limits": {
+    "max_chunk_size": 4194304,
+    "max_manifest_size": 8388608,
+    "max_object_size": 4294967296,
+    "max_parallel_chunk_streams": 8
+  }
+}

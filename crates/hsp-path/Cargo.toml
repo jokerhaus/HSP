@@ -1,0 +1,8 @@
+[package]
+name = "hsp-path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"

@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hsp-s3
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hsp-s3
+  template:
+    metadata:
+      labels:
+        app: hsp-s3
+    spec:
+      serviceAccountName: hsp-s3
+      containers:
+        - name: hsp-s3
+          image: ghcr.io/example/hsp/hsp-s3:0.1.0
+          env:
+            - name: HSP_ROOT_DIR
+              value: /var/lib/hsp
+            - name: HSP_ISSUER_REGISTRY
+              value: /etc/hsp/issuer-registry.json
+            - name: HSP_KMS_URI
+              value: "kms://workload-identity/public-multi-tenant"
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: hsp-data
+              mountPath: /var/lib/hsp
+            - name: hsp-config
+              mountPath: /etc/hsp
+              readOnly: true
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+      volumes:
+        - name: hsp-data
+          emptyDir: {}
+        - name: hsp-config
+          configMap:
+            name: hsp-config

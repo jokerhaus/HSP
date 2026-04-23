@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "authority_profile": "public-multi-tenant",
+  "e2ee_required": true,
+  "storage_encryption_required": true,
+  "crypto_suite": [
+    "Ed25519",
+    "COSE_Sign1",
+    "XChaCha20-Poly1305",
+    "AES-256-GCM",
+    "SHA-256"
+  ],
+  "key_wrapping_suite": "HPKE/X25519",
+  "tenant_isolation_profile": "strict-per-tenant-key-domain",
+  "cross_tenant_plaintext_dedup": false
+}

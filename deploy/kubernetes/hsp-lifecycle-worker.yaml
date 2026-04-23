@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: hsp-lifecycle-worker
+spec:
+  schedule: "*/10 * * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          serviceAccountName: hsp-lifecycle-worker
+          restartPolicy: OnFailure
+          containers:
+            - name: worker
+              image: ghcr.io/example/hsp/hsp-s3:0.1.0
+              args: ["worker", "lifecycle"]
+              env:
+                - name: HSP_ROOT_DIR
+                  value: /var/lib/hsp
+                - name: HSP_ISSUER_REGISTRY
+                  value: /etc/hsp/issuer-registry.json
+              volumeMounts:
+                - name: hsp-data
+                  mountPath: /var/lib/hsp
+                - name: hsp-config
+                  mountPath: /etc/hsp
+                  readOnly: true
+              securityContext:
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+          volumes:
+            - name: hsp-data
+              emptyDir: {}
+            - name: hsp-config
+              configMap:
+                name: hsp-config

@@ -1,0 +1,33 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hspd
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hspd
+  template:
+    metadata:
+      labels:
+        app: hspd
+    spec:
+      serviceAccountName: hspd
+      containers:
+        - name: hspd
+          image: ghcr.io/example/hsp/hspd:0.1.0
+          args: ["--profile=public-multi-tenant"]
+          env:
+            - name: HSP_KMS_URI
+              value: "kms://workload-identity/public-multi-tenant"
+          ports:
+            - containerPort: 443
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+

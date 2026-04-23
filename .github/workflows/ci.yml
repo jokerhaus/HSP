@@ -1,0 +1,130 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dependency-review:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+
+  go:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.work
+      - name: Sync Go workspace
+        run: GOTOOLCHAIN=go1.25.9+auto go work sync
+      - name: Install govulncheck
+        run: GOTOOLCHAIN=go1.25.9+auto go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Go tests
+        run: |
+          mkdir -p artifacts
+          GOTOOLCHAIN=go1.25.9+auto go test ./sdk/go/... ./cli/hspctl/... | tee artifacts/go-test.txt
+      - name: Go vulnerability check (sdk/go)
+        run: |
+          mkdir -p artifacts
+          cd sdk/go
+          GOTOOLCHAIN=go1.25.9+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee ../artifacts/govulncheck-sdk-go.txt
+      - name: Go vulnerability check (cli/hspctl)
+        run: |
+          mkdir -p artifacts
+          cd cli/hspctl
+          GOTOOLCHAIN=go1.25.9+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee ../../artifacts/govulncheck-hspctl.txt
+      - name: Upload Go artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-security-reports
+          path: |
+            artifacts/go-test.txt
+            artifacts/govulncheck-sdk-go.txt
+            artifacts/govulncheck-hspctl.txt
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Rust tests
+        run: |
+          mkdir -p artifacts
+          cargo test --workspace --all-targets | tee artifacts/cargo-test.txt
+      - name: Rust clippy
+        run: |
+          mkdir -p artifacts
+          cargo clippy --workspace --all-targets -- -D warnings | tee artifacts/cargo-clippy.txt
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Rust audit
+        run: |
+          mkdir -p artifacts
+          env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit | tee artifacts/cargo-audit.txt
+      - name: Upload Rust artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-security-reports
+          path: |
+            artifacts/cargo-test.txt
+            artifacts/cargo-clippy.txt
+            artifacts/cargo-audit.txt
+
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Run conformance
+        run: |
+          mkdir -p artifacts
+          cargo run -p hsp-conformance > artifacts/hsp-conformance-report.json
+      - name: Validate conformance report
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("artifacts/hsp-conformance-report.json").read_text())
+          if not report.get("ok"):
+              raise SystemExit("hsp-conformance reported failure")
+          PY
+      - name: Upload conformance artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsp-conformance-report
+          path: artifacts/hsp-conformance-report.json
+
+  sbom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare artifact directory
+        run: mkdir -p artifacts
+      - name: Generate SPDX SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: spdx-json
+          output-file: artifacts/hsp-source.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hsp-source-sbom
+          path: artifacts/hsp-source.spdx.json

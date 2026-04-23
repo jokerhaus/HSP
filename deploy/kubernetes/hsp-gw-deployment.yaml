@@ -1,0 +1,30 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: hsp-gw
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: hsp-gw
+  template:
+    metadata:
+      labels:
+        app: hsp-gw
+    spec:
+      serviceAccountName: hsp-gw
+      containers:
+        - name: hsp-gw
+          image: ghcr.io/example/hsp/hsp-gw:0.1.0
+          args: ["--profile=public-multi-tenant"]
+          ports:
+            - containerPort: 443
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+

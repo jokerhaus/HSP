@@ -1,0 +1,6 @@
+{
+  "name": "segment-aware-prefix-confusion",
+  "prefix": "tenant/a",
+  "candidate": "tenant/alpha",
+  "expected_match": false
+}
