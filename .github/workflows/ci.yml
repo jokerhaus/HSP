@@ -29,18 +29,18 @@ jobs:
         run: GOTOOLCHAIN=go1.25.9+auto go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Go tests
         run: |
-          mkdir -p artifacts
-          GOTOOLCHAIN=go1.25.9+auto go test ./sdk/go/... ./cli/hspctl/... | tee artifacts/go-test.txt
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
+          GOTOOLCHAIN=go1.25.9+auto go test ./sdk/go/... ./cli/hspctl/... | tee "$GITHUB_WORKSPACE/artifacts/go-test.txt"
       - name: Go vulnerability check (sdk/go)
         run: |
-          mkdir -p artifacts
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cd sdk/go
-          GOTOOLCHAIN=go1.25.9+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee ../artifacts/govulncheck-sdk-go.txt
+          GOTOOLCHAIN=go1.25.9+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee "$GITHUB_WORKSPACE/artifacts/govulncheck-sdk-go.txt"
       - name: Go vulnerability check (cli/hspctl)
         run: |
-          mkdir -p artifacts
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cd cli/hspctl
-          GOTOOLCHAIN=go1.25.9+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee ../../artifacts/govulncheck-hspctl.txt
+          GOTOOLCHAIN=go1.25.9+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee "$GITHUB_WORKSPACE/artifacts/govulncheck-hspctl.txt"
       - name: Upload Go artifacts
         if: always()
         uses: actions/upload-artifact@v4
