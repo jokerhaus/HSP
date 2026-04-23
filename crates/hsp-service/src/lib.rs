@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -39,6 +40,70 @@ pub struct AlphaService {
     kms: LocalDevKms,
     policy_engine: PolicyEngine,
     issuer_registry: Option<IssuerRegistry>,
+    observability: ObservabilityState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceMetricEntry {
+    pub operation: String,
+    pub tenant_id: String,
+    pub namespace: Option<String>,
+    pub status_code: u16,
+    pub outcome: String,
+    pub count: u64,
+    pub latency_ms_sum: u64,
+    pub object_size_bytes_sum: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceMetricSnapshot {
+    pub entries: Vec<ServiceMetricEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StructuredLogRecord {
+    pub at_ms: u64,
+    pub operation: String,
+    pub tenant_id: String,
+    pub namespace: Option<String>,
+    pub status_code: u16,
+    pub outcome: String,
+    pub latency_ms: u64,
+    pub object_size_bytes: Option<u64>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ObservabilityState {
+    metrics: Mutex<BTreeMap<MetricKey, MetricValue>>,
+    logs: Mutex<Vec<StructuredLogRecord>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetricKey {
+    operation: String,
+    tenant_id: String,
+    namespace: Option<String>,
+    status_code: u16,
+    outcome: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct MetricValue {
+    count: u64,
+    latency_ms_sum: u64,
+    object_size_bytes_sum: u64,
+}
+
+struct Observation<'a> {
+    operation: &'a str,
+    tenant_id: &'a TenantId,
+    namespace: Option<&'a str>,
+    status_code: u16,
+    outcome: &'a str,
+    latency_ms: u64,
+    object_size_bytes: Option<u64>,
+    error_code: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +200,7 @@ impl AlphaService {
             kms,
             policy_engine: PolicyEngine::new(),
             issuer_registry: None,
+            observability: ObservabilityState::default(),
         };
 
         service.ensure_store_roots()?;
@@ -181,11 +247,76 @@ impl AlphaService {
         }
     }
 
+    pub fn metrics_snapshot(&self) -> ServiceMetricSnapshot {
+        let entries = self
+            .observability
+            .metrics
+            .lock()
+            .expect("metrics lock poisoned")
+            .iter()
+            .map(|(key, value)| ServiceMetricEntry {
+                operation: key.operation.clone(),
+                tenant_id: key.tenant_id.clone(),
+                namespace: key.namespace.clone(),
+                status_code: key.status_code,
+                outcome: key.outcome.clone(),
+                count: value.count,
+                latency_ms_sum: value.latency_ms_sum,
+                object_size_bytes_sum: value.object_size_bytes_sum,
+            })
+            .collect();
+        ServiceMetricSnapshot { entries }
+    }
+
+    pub fn structured_logs(&self) -> Vec<StructuredLogRecord> {
+        self.observability
+            .logs
+            .lock()
+            .expect("structured logs lock poisoned")
+            .clone()
+    }
+
+    pub fn prometheus_metrics(&self) -> String {
+        let snapshot = self.metrics_snapshot();
+        let mut output = String::from(
+            "# HELP hsp_requests_total HSP requests by operation, tenant, namespace, status, and outcome.\n\
+             # TYPE hsp_requests_total counter\n",
+        );
+        for entry in &snapshot.entries {
+            let labels = prometheus_labels(entry);
+            output.push_str(&format!("hsp_requests_total{{{labels}}} {}\n", entry.count));
+        }
+        output.push_str(
+            "# HELP hsp_request_latency_ms_sum Total observed HSP request latency in milliseconds.\n\
+             # TYPE hsp_request_latency_ms_sum counter\n",
+        );
+        for entry in &snapshot.entries {
+            let labels = prometheus_labels(entry);
+            output.push_str(&format!(
+                "hsp_request_latency_ms_sum{{{labels}}} {}\n",
+                entry.latency_ms_sum
+            ));
+        }
+        output.push_str(
+            "# HELP hsp_object_size_bytes_sum Total observed HSP object or chunk size in bytes.\n\
+             # TYPE hsp_object_size_bytes_sum counter\n",
+        );
+        for entry in &snapshot.entries {
+            let labels = prometheus_labels(entry);
+            output.push_str(&format!(
+                "hsp_object_size_bytes_sum{{{labels}}} {}\n",
+                entry.object_size_bytes_sum
+            ));
+        }
+        output
+    }
+
     pub fn put_init(
         &self,
         auth: &AuthContext,
         request: PutInitRequest,
     ) -> Result<PutInitResponse, ApiError> {
+        let started_at_ms = now_ms();
         request.manifest.validate()?;
 
         if request.manifest.tenant_id != request.tenant_id {
@@ -249,6 +380,19 @@ impl AlphaService {
                 "idempotency",
                 &idempotency_key,
             )? {
+                self.record_observation(Observation {
+                    operation: "put_init",
+                    tenant_id: &request.tenant_id,
+                    namespace: request
+                        .atomic_bind
+                        .as_ref()
+                        .map(|bind| bind.namespace.as_str()),
+                    status_code: 200,
+                    outcome: "idempotent_retry",
+                    latency_ms: elapsed_ms(started_at_ms),
+                    object_size_bytes: Some(request.manifest.stored_size),
+                    error_code: None,
+                });
                 return Ok(record.response);
             }
         }
@@ -298,6 +442,19 @@ impl AlphaService {
             },
         )?;
 
+        self.record_observation(Observation {
+            operation: "put_init",
+            tenant_id: &request.tenant_id,
+            namespace: request
+                .atomic_bind
+                .as_ref()
+                .map(|bind| bind.namespace.as_str()),
+            status_code: 200,
+            outcome: "ok",
+            latency_ms: elapsed_ms(started_at_ms),
+            object_size_bytes: Some(request.manifest.stored_size),
+            error_code: None,
+        });
         Ok(response)
     }
 
@@ -307,8 +464,19 @@ impl AlphaService {
         request: PutChunkRequest,
         ciphertext_chunk: &[u8],
     ) -> Result<PutChunkResponse, ApiError> {
+        let started_at_ms = now_ms();
         let chunk_cid = hsp_core::cid_from_bytes(ciphertext_chunk);
         if chunk_cid != request.chunk_cid {
+            self.record_observation(Observation {
+                operation: "integrity_error",
+                tenant_id: &request.tenant_id,
+                namespace: None,
+                status_code: 400,
+                outcome: "integrity_error",
+                latency_ms: elapsed_ms(started_at_ms),
+                object_size_bytes: Some(ciphertext_chunk.len() as u64),
+                error_code: Some("chunk_cid_mismatch"),
+            });
             return Err(ApiError::new(
                 ApiErrorCategory::Validation,
                 "chunk_cid_mismatch",
@@ -401,11 +569,22 @@ impl AlphaService {
             &updated,
         )?;
 
-        Ok(PutChunkResponse {
+        let response = PutChunkResponse {
             stored: !duplicate,
             duplicate,
             verified_cid: true,
-        })
+        };
+        self.record_observation(Observation {
+            operation: "put_chunk",
+            tenant_id: &request.tenant_id,
+            namespace: None,
+            status_code: 200,
+            outcome: if duplicate { "duplicate" } else { "ok" },
+            latency_ms: elapsed_ms(started_at_ms),
+            object_size_bytes: Some(ciphertext_chunk.len() as u64),
+            error_code: None,
+        });
+        Ok(response)
     }
 
     pub fn put_commit(
@@ -413,6 +592,7 @@ impl AlphaService {
         auth: &AuthContext,
         request: PutCommitRequest,
     ) -> Result<PutCommitResponse, ApiError> {
+        let started_at_ms = now_ms();
         let session = self
             .read_encrypted_json::<UploadSessionRecord>(
                 &request.tenant_id,
@@ -462,6 +642,19 @@ impl AlphaService {
                 "idempotency",
                 &idempotency_key,
             )? {
+                self.record_observation(Observation {
+                    operation: "put",
+                    tenant_id: &request.tenant_id,
+                    namespace: session
+                        .atomic_bind
+                        .as_ref()
+                        .map(|bind| bind.namespace.as_str()),
+                    status_code: 200,
+                    outcome: "idempotent_retry",
+                    latency_ms: elapsed_ms(started_at_ms),
+                    object_size_bytes: Some(session.manifest.stored_size),
+                    error_code: None,
+                });
                 return Ok(record.response);
             }
         }
@@ -569,10 +762,24 @@ impl AlphaService {
             },
         )?;
 
+        self.record_observation(Observation {
+            operation: "put",
+            tenant_id: &request.tenant_id,
+            namespace: session
+                .atomic_bind
+                .as_ref()
+                .map(|bind| bind.namespace.as_str()),
+            status_code: 200,
+            outcome: "ok",
+            latency_ms: elapsed_ms(started_at_ms),
+            object_size_bytes: Some(session.manifest.stored_size),
+            error_code: None,
+        });
         Ok(response)
     }
 
     pub fn head(&self, auth: &AuthContext, request: HeadRequest) -> Result<HeadResponse, ApiError> {
+        let started_at_ms = now_ms();
         request.selector.validate()?;
         let resolution = self.selector_resolution(&request.tenant_id, &request.selector)?;
         let manifest_cid = resolution.manifest_cid.clone();
@@ -591,18 +798,30 @@ impl AlphaService {
         self.authorize(auth, &meta)?;
 
         let record = self.manifest_record(&request.tenant_id, &manifest_cid)?;
-
-        Ok(HeadResponse {
+        let response = HeadResponse {
+            exists: true,
+            deleted: false,
+            cid: record.object_cid.clone(),
             object_cid: record.object_cid.clone(),
             manifest_cid: record.manifest_cid.clone(),
+            integrity_hash: record.object_cid.clone(),
             storage_class: record.storage_class.clone(),
             resolved_namespace: resolution.namespace,
             resolved_path: resolution.path,
             resolved_revision: resolution.revision,
             resolved_record_cid: resolution.record_cid,
+            size_bytes: record.manifest.logical_size,
+            ciphertext_size_bytes: record.manifest.stored_size,
             logical_size: record.manifest.logical_size,
             stored_size: record.manifest.stored_size,
             content_type: record.manifest.content_type.clone(),
+            created_at_ms: record.manifest.created_at_ms,
+            encryption_profile_id: record
+                .manifest
+                .encryption_descriptor
+                .encryption_profile_id
+                .clone(),
+            key_policy_id: record.manifest.encryption_descriptor.key_policy_id.clone(),
             metadata_visibility: record.manifest.encryption_descriptor.metadata_visibility,
             server_visible_metadata: record
                 .manifest
@@ -614,10 +833,23 @@ impl AlphaService {
                 .encryption_descriptor
                 .encrypted_client_metadata
                 .is_empty(),
-        })
+        };
+        self.record_observation(Observation {
+            operation: "head",
+            tenant_id: &request.tenant_id,
+            namespace: response.resolved_namespace.as_deref(),
+            status_code: 200,
+            outcome: "ok",
+            latency_ms: elapsed_ms(started_at_ms),
+            object_size_bytes: Some(response.ciphertext_size_bytes),
+            error_code: None,
+        });
+
+        Ok(response)
     }
 
     pub fn get(&self, auth: &AuthContext, request: GetRequest) -> Result<GetResponse, ApiError> {
+        let started_at_ms = now_ms();
         request.selector.validate()?;
         if let Some(range) = &request.range {
             range.validate()?;
@@ -650,16 +882,29 @@ impl AlphaService {
 
         let mut response = GetResponse {
             meta: GetResponseMeta {
+                exists: true,
+                deleted: false,
+                cid: record.object_cid.clone(),
                 object_cid: record.object_cid.clone(),
                 manifest_cid: record.manifest_cid.clone(),
+                integrity_hash: record.object_cid.clone(),
                 storage_class: record.storage_class.clone(),
                 resolved_namespace: resolution.namespace.clone(),
                 resolved_path: resolution.path.clone(),
                 resolved_revision: resolution.revision,
                 resolved_record_cid: resolution.record_cid.clone(),
+                size_bytes: record.manifest.logical_size,
+                ciphertext_size_bytes: record.manifest.stored_size,
                 logical_size: record.manifest.logical_size,
                 stored_size: record.manifest.stored_size,
                 content_type: record.manifest.content_type.clone(),
+                created_at_ms: record.manifest.created_at_ms,
+                encryption_profile_id: record
+                    .manifest
+                    .encryption_descriptor
+                    .encryption_profile_id
+                    .clone(),
+                key_policy_id: record.manifest.encryption_descriptor.key_policy_id.clone(),
                 metadata_visibility: record.manifest.encryption_descriptor.metadata_visibility,
                 server_visible_metadata: record
                     .manifest
@@ -680,6 +925,16 @@ impl AlphaService {
 
         if preference == GetPreference::ManifestOnly {
             response.meta.manifest = Some(record.manifest.clone());
+            self.record_observation(Observation {
+                operation: "get",
+                tenant_id: &request.tenant_id,
+                namespace: response.meta.resolved_namespace.as_deref(),
+                status_code: 200,
+                outcome: "manifest_only",
+                latency_ms: elapsed_ms(started_at_ms),
+                object_size_bytes: Some(response.meta.ciphertext_size_bytes),
+                error_code: None,
+            });
             return Ok(response);
         }
 
@@ -749,6 +1004,16 @@ impl AlphaService {
             });
         }
 
+        self.record_observation(Observation {
+            operation: "get",
+            tenant_id: &request.tenant_id,
+            namespace: response.meta.resolved_namespace.as_deref(),
+            status_code: 200,
+            outcome: "chunk_stream",
+            latency_ms: elapsed_ms(started_at_ms),
+            object_size_bytes: Some(response.meta.ciphertext_size_bytes),
+            error_code: None,
+        });
         Ok(response)
     }
 
@@ -1052,6 +1317,16 @@ impl AlphaService {
     ) -> Result<hsp_auth::AuthorizationDecision, ApiError> {
         self.policy_engine.authorize(auth, meta).map_err(|reason| {
             let error = denial_to_api_error(reason.clone());
+            self.record_observation(Observation {
+                operation: "auth_denied",
+                tenant_id: meta.tenant_id,
+                namespace: meta.namespace,
+                status_code: 403,
+                outcome: "auth_denied",
+                latency_ms: 0,
+                object_size_bytes: meta.content_size,
+                error_code: Some(&error.code),
+            });
             let _ = self.append_event(
                 meta.tenant_id,
                 EventRecord {
@@ -1283,6 +1558,7 @@ impl AlphaService {
         request: UnbindRequest,
         persist_idempotency: bool,
     ) -> Result<UnbindResponse, ApiError> {
+        let started_at_ms = now_ms();
         let (namespace, path) =
             self.canonical_namespace_and_path(&request.namespace, &request.path)?;
         let signed_record = self.verify_signed_unbind_record(&request, &namespace, &path)?;
@@ -1321,6 +1597,16 @@ impl AlphaService {
                 "idempotency",
                 &idempotency_key,
             )? {
+                self.record_observation(Observation {
+                    operation: "delete",
+                    tenant_id: &request.tenant_id,
+                    namespace: Some(&namespace),
+                    status_code: 200,
+                    outcome: "idempotent_retry",
+                    latency_ms: elapsed_ms(started_at_ms),
+                    object_size_bytes: None,
+                    error_code: None,
+                });
                 return Ok(record.response);
             }
         }
@@ -1417,6 +1703,20 @@ impl AlphaService {
                 },
             )?;
         }
+        self.record_observation(Observation {
+            operation: "delete",
+            tenant_id: &request.tenant_id,
+            namespace: Some(&namespace),
+            status_code: 200,
+            outcome: if tombstone {
+                "tombstoned"
+            } else {
+                "hard_deleted"
+            },
+            latency_ms: elapsed_ms(started_at_ms),
+            object_size_bytes: None,
+            error_code: None,
+        });
         Ok(response)
     }
 
@@ -1816,7 +2116,20 @@ impl AlphaService {
         let envelope = self
             .kms
             .encrypt_store_payload(tenant_id, store_kind, bytes)
-            .map_err(|error| crypto_error_to_api(error, "failed to encrypt store payload"))?;
+            .map_err(|error| {
+                let api_error = crypto_error_to_api(error, "failed to encrypt store payload");
+                self.record_observation(Observation {
+                    operation: "kms_error",
+                    tenant_id,
+                    namespace: None,
+                    status_code: 500,
+                    outcome: "kms_error",
+                    latency_ms: 0,
+                    object_size_bytes: Some(bytes.len() as u64),
+                    error_code: Some(&api_error.code),
+                });
+                api_error
+            })?;
         self.write_envelope(tenant_id, store_kind, key, &envelope)
     }
 
@@ -1884,7 +2197,20 @@ impl AlphaService {
         self.kms
             .decrypt_store_payload(tenant_id, store_kind, &envelope)
             .map(Some)
-            .map_err(|error| crypto_error_to_api(error, "failed to decrypt store payload"))
+            .map_err(|error| {
+                let api_error = crypto_error_to_api(error, "failed to decrypt store payload");
+                self.record_observation(Observation {
+                    operation: "kms_error",
+                    tenant_id,
+                    namespace: None,
+                    status_code: 500,
+                    outcome: "kms_error",
+                    latency_ms: 0,
+                    object_size_bytes: None,
+                    error_code: Some(&api_error.code),
+                });
+                api_error
+            })
     }
 
     fn write_envelope(
@@ -1952,6 +2278,53 @@ impl AlphaService {
             cid_from_bytes(value.as_bytes())
         )
     }
+
+    fn record_observation(&self, observation: Observation<'_>) {
+        let operation = observation.operation.to_string();
+        let outcome = observation.outcome.to_string();
+        let namespace = observation.namespace.map(ToString::to_string);
+        let key = MetricKey {
+            operation: operation.clone(),
+            tenant_id: observation.tenant_id.0.clone(),
+            namespace: namespace.clone(),
+            status_code: observation.status_code,
+            outcome: outcome.clone(),
+        };
+        let mut metrics = self
+            .observability
+            .metrics
+            .lock()
+            .expect("metrics lock poisoned");
+        let value = metrics.entry(key).or_default();
+        value.count = value.count.saturating_add(1);
+        value.latency_ms_sum = value.latency_ms_sum.saturating_add(observation.latency_ms);
+        value.object_size_bytes_sum = value
+            .object_size_bytes_sum
+            .saturating_add(observation.object_size_bytes.unwrap_or_default());
+        drop(metrics);
+
+        let mut logs = self
+            .observability
+            .logs
+            .lock()
+            .expect("structured logs lock poisoned");
+        logs.push(StructuredLogRecord {
+            at_ms: now_ms(),
+            operation,
+            tenant_id: observation.tenant_id.0.clone(),
+            namespace,
+            status_code: observation.status_code,
+            outcome,
+            latency_ms: observation.latency_ms,
+            object_size_bytes: observation.object_size_bytes,
+            error_code: observation.error_code.map(ToString::to_string),
+        });
+        const MAX_LOG_RECORDS: usize = 1024;
+        if logs.len() > MAX_LOG_RECORDS {
+            let overflow = logs.len() - MAX_LOG_RECORDS;
+            logs.drain(0..overflow);
+        }
+    }
 }
 
 pub fn default_alpha_service(root_dir: impl AsRef<Path>) -> Result<AlphaService, ApiError> {
@@ -1982,6 +2355,28 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .expect("system clock before unix epoch")
         .as_millis() as u64
+}
+
+fn elapsed_ms(start_ms: u64) -> u64 {
+    now_ms().saturating_sub(start_ms)
+}
+
+fn prometheus_labels(entry: &ServiceMetricEntry) -> String {
+    format!(
+        "operation=\"{}\",tenant=\"{}\",namespace=\"{}\",status_code=\"{}\",outcome=\"{}\"",
+        prometheus_escape(&entry.operation),
+        prometheus_escape(&entry.tenant_id),
+        prometheus_escape(entry.namespace.as_deref().unwrap_or("")),
+        entry.status_code,
+        prometheus_escape(&entry.outcome)
+    )
+}
+
+fn prometheus_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 #[cfg(test)]
@@ -2171,7 +2566,19 @@ mod tests {
             head.server_visible_metadata.get("content-language"),
             Some(&"ru".to_string())
         );
+        assert!(head.exists);
+        assert!(!head.deleted);
+        assert_eq!(head.cid, head.object_cid);
+        assert_eq!(head.integrity_hash, head.object_cid);
+        assert_eq!(head.size_bytes, 11);
+        assert_eq!(head.ciphertext_size_bytes, 11);
+        assert_eq!(head.encryption_profile_id.0, "public-e2ee-v1");
+        assert_eq!(head.key_policy_id.0, "policy-default");
         assert!(head.encrypted_client_metadata_redacted);
+
+        let metrics = service.prometheus_metrics();
+        assert!(metrics.contains("hsp_requests_total"));
+        assert!(metrics.contains("operation=\"head\""));
     }
 
     #[test]
@@ -2267,6 +2674,41 @@ mod tests {
             .unwrap();
         assert_eq!(chunk_stream.chunks.len(), 1);
         assert_eq!(chunk_stream.chunks[0].bytes, chunk_bytes);
+        assert_eq!(
+            chunk_stream.meta.integrity_hash,
+            chunk_stream.meta.object_cid
+        );
+        assert_eq!(chunk_stream.meta.ciphertext_size_bytes, 11);
+        assert_eq!(chunk_stream.meta.encryption_profile_id.0, "public-e2ee-v1");
+    }
+
+    #[test]
+    fn put_chunk_rejects_cid_mismatch_and_records_integrity_metric() {
+        let service = service();
+        let auth = auth_context();
+        let error = service
+            .put_chunk(
+                &auth,
+                PutChunkRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    session_id: "session-missing".to_string(),
+                    chunk_index: 0,
+                    chunk_cid: hsp_core::cid_from_bytes(b"expected"),
+                    chunk_offset: 0,
+                    chunk_length: 8,
+                    content_encoding: "identity".to_string(),
+                },
+                b"tampered",
+            )
+            .expect_err("tampered chunk must be rejected before storage");
+
+        assert_eq!(error.code, "chunk_cid_mismatch");
+        let metrics = service.prometheus_metrics();
+        assert!(metrics.contains("operation=\"integrity_error\""));
+        assert!(service
+            .structured_logs()
+            .iter()
+            .any(|record| record.error_code.as_deref() == Some("chunk_cid_mismatch")));
     }
 
     #[test]

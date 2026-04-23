@@ -1,7 +1,95 @@
 # HSP
 
-HSP is a secure-by-default Hybrid Storage Protocol reference repository. This
-bootstrap adopts a hardened `public multi-tenant` security baseline with:
+HSP (Hybrid Storage Protocol) is a secure storage protocol and reference
+implementation for teams that need an object store they can trust, observe, and
+extend. In simple terms: HSP lets an application upload files, read them back,
+share them through S3-like and CDN-like services, and still keep the public
+profile ciphertext-only.
+
+## What Problem HSP Solves
+
+Most applications start with a simple storage provider: upload a file, store a
+URL, download it later. That works until the product needs stronger guarantees:
+
+- files must stay encrypted in storage
+- tenants must not be able to see each other's data
+- the backend must verify that an object exists and is intact without
+  downloading the whole file
+- operators need metrics and logs from the storage layer itself
+- existing tools still expect S3-style buckets and object keys
+- downloads need CDN-style delivery without turning the edge into a plaintext
+  data leak
+
+HSP is built for that point. It gives you a storage core, a native protocol,
+an HTTP/3 gateway, an S3-like surface, and a CDN-like edge layer that all share
+the same auth, policy, encryption, and tenant-isolation rules.
+
+## Plain-Language Examples
+
+### Media App
+
+A chat or social app stores images and videos through HSP. The app encrypts
+the media before upload. HSP stores only ciphertext, returns a stable content
+ID, and lets the backend check:
+
+```json
+{
+  "exists": true,
+  "size_bytes": 1786060,
+  "ciphertext_size_bytes": 1786200,
+  "integrity_hash": "sha256-...",
+  "cid": "sha256-...",
+  "encryption_profile_id": "ping-media-v1",
+  "key_policy_id": "ping-media-default"
+}
+```
+
+The backend can verify the object without downloading the bytes again.
+
+### SaaS Tenant Storage
+
+Each customer gets isolated namespaces and keys. One tenant cannot confirm or
+read another tenant's objects. Logs, metrics, cache keys, and replay protection
+all carry tenant context.
+
+### S3-Compatible Integration
+
+Existing internal tools can use bucket/key semantics through `hsp-s3`:
+
+```bash
+aws --endpoint-url http://localhost:8081 s3 cp ./photo.enc s3://media/photos/1.enc
+aws --endpoint-url http://localhost:8081 s3 ls s3://media/photos/
+```
+
+The compatibility is for HTTP/auth/object behavior. In the public profile, HSP
+still serves ciphertext, not plaintext.
+
+### CDN-Like Delivery
+
+`hsp-cdn` can serve immutable objects by CID and mutable bucket/key routes. CID
+routes can be cached aggressively. Namespace or bucket/key routes use shorter
+TTL and purge on mutation events, so stale bindings do not live forever at the
+edge.
+
+## What You Get By Using HSP
+
+- A Rust reference server for the native HSP protocol.
+- An HTTP/3 gateway for clients that want HTTP semantics.
+- S3-like object storage compatibility through `hsp-s3`.
+- CDN-like edge delivery through `hsp-cdn`.
+- Client-side encryption first in the public profile.
+- Envelope encryption for persisted internal stores.
+- Capability-based auth, channel binding, replay protection, and signed
+  namespace mutations.
+- `HEAD` and metadata APIs for cheap existence and integrity checks.
+- Prometheus metrics and structured, secret-aware logs from the storage layer.
+- Go SDK and CLI surfaces for integration and diagnostics.
+- A black-box conformance harness for native, gateway, S3-like, and CDN-like
+  behavior.
+
+## Security Baseline
+
+This bootstrap adopts a hardened `public multi-tenant` security baseline with:
 
 - Rust as the primary implementation language for the native server, gateway,
   parser surfaces, auth engine, crypto profile wiring, and conformance harness.
@@ -40,6 +128,32 @@ HSP runtime. In the public profile they remain ciphertext-only: clients upload
 and download ciphertext, and plaintext assembly stays outside the server/edge
 boundary.
 
+## Metadata And Observability
+
+HSP exposes a cheap existence and integrity path so storage clients do not have
+to download objects just to verify them:
+
+- Native/gateway `HEAD` returns HSP integrity headers including
+  `x-hsp-exists`, `x-hsp-deleted`, `x-hsp-cid`, `x-hsp-integrity-hash`,
+  `x-hsp-size-bytes`, `x-hsp-ciphertext-size-bytes`,
+  `x-hsp-encryption-profile-id`, and `x-hsp-key-policy-id`.
+- Gateway JSON metadata endpoints are available at
+  `/v1/objects/cid/{cid}/metadata?tenant_id=...` and
+  `/v1/objects/namespace/{namespace}/{path}/metadata?tenant_id=...`.
+- `integrity_hash` is the canonical HSP object integrity hash
+  (`object_cid == manifest_cid` in this release) and is computed from the
+  deterministic manifest that commits the ciphertext chunk CIDs.
+
+Production observability is first-class and secret-aware:
+
+- `GET /metrics` exposes Prometheus text metrics for `put`, `get`, `delete`,
+  `auth_denied`, `kms_error`, `integrity_error`, latency sums, and object-size
+  sums.
+- `GET /v1/observability/logs` returns recent structured, secret-redacted log
+  records for debugging.
+- Both observability endpoints require capability auth with
+  `admin.metrics.read` or `admin.audit.read`.
+
 ## Toolchains
 
 - Rust stable with `rustfmt` and `clippy`
@@ -64,7 +178,7 @@ Release artifacts also include:
 - dependency-review PR gate results
 - `cargo audit` and `govulncheck` reports
 - `hsp-conformance` JSON report
-- release evidence bundle under [docs/release-evidence](/Users/loxar/Documents/GitHub/HSP/docs/release-evidence)
+- release evidence bundle under [docs/release-evidence](docs/release-evidence)
 
 ## Bootstrap Commands
 

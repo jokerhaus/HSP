@@ -23,9 +23,9 @@ use hsp_auth::{
     IssuerRegistry,
 };
 use hsp_core::{
-    ApiError, ApiErrorCategory, BindRequest, GetPreference, GetRequest, HeadRequest, ListRequest,
-    ObjectSelector, PutChunkRequest, PutCommitRequest, PutInitRequest, ResolveRequest,
-    SubscribeEnvelopeKind, SubscribeFilter, SubscribeRequest, UnbindRequest,
+    ApiError, ApiErrorCategory, BindRequest, CapabilityScope, GetPreference, GetRequest,
+    HeadRequest, ListRequest, ObjectSelector, PutChunkRequest, PutCommitRequest, PutInitRequest,
+    ResolveRequest, SubscribeEnvelopeKind, SubscribeFilter, SubscribeRequest, UnbindRequest,
 };
 use hsp_service::{AlphaConfig, AlphaService};
 
@@ -193,11 +193,63 @@ where
             &state.service.bootstrap_document(),
         )?),
         (&Method::GET, "/v1/info") => Ok(json_response(StatusCode::OK, &state.service.info())?),
+        (&Method::GET, "/metrics") => {
+            let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
+            require_scope(&auth, CapabilityScope::AdminMetricsRead)?;
+            Ok(text_response(
+                StatusCode::OK,
+                "text/plain; version=0.0.4",
+                state.service.prometheus_metrics(),
+            )?)
+        }
+        (&Method::GET, "/v1/observability/logs") => {
+            let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
+            require_scope(&auth, CapabilityScope::AdminAuditRead)?;
+            Ok(json_response(
+                StatusCode::OK,
+                &state.service.structured_logs(),
+            )?)
+        }
         (&Method::POST, "/v1/uploads") => {
             let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
             let body = read_http_body(stream).await.map_err(http_body_error)?;
             let request: PutInitRequest = serde_json::from_slice(&body).map_err(bad_json)?;
             let response = state.service.put_init(&auth, request)?;
+            Ok(json_response(StatusCode::OK, &response)?)
+        }
+        (&Method::GET, object_path)
+            if object_path.starts_with("/v1/objects/namespace/")
+                && object_path.ends_with("/metadata") =>
+        {
+            let metadata_path = object_path.trim_end_matches("/metadata");
+            let (namespace, path) =
+                split_namespace_object_route(metadata_path, "/v1/objects/namespace/")?;
+            let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
+            let response = state.service.head(
+                &auth,
+                HeadRequest {
+                    tenant_id: tenant_from_query(query)?,
+                    selector: ObjectSelector::namespace(namespace, path),
+                },
+            )?;
+            Ok(json_response(StatusCode::OK, &response)?)
+        }
+        (&Method::GET, object_path)
+            if object_path.starts_with("/v1/objects/cid/")
+                && object_path.ends_with("/metadata") =>
+        {
+            let cid = object_path
+                .trim_start_matches("/v1/objects/cid/")
+                .trim_end_matches("/metadata")
+                .to_string();
+            let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
+            let response = state.service.head(
+                &auth,
+                HeadRequest {
+                    tenant_id: tenant_from_query(query)?,
+                    selector: ObjectSelector::cid(cid),
+                },
+            )?;
             Ok(json_response(StatusCode::OK, &response)?)
         }
         (&Method::GET, object_path) if object_path.starts_with("/v1/objects/namespace/") => {
@@ -568,6 +620,19 @@ fn json_response<T: serde::Serialize>(
     Ok((response, Some(vec![Bytes::from(body)])))
 }
 
+fn text_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Result<(Response<()>, Option<Vec<Bytes>>), ApiError> {
+    let response = Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, content_type)
+        .body(())
+        .map_err(http_build_error)?;
+    Ok((response, Some(vec![Bytes::from(body)])))
+}
+
 fn chunk_stream_response(
     meta: &hsp_core::GetResponseMeta,
     chunks: &[hsp_core::GetChunk],
@@ -608,13 +673,28 @@ fn head_response(
             HeaderName::from_static("x-hsp-object-cid"),
             head.object_cid.as_str(),
         )
+        .header(HeaderName::from_static("x-hsp-exists"), "true")
+        .header(HeaderName::from_static("x-hsp-deleted"), "false")
+        .header(HeaderName::from_static("x-hsp-cid"), head.cid.as_str())
         .header(
             HeaderName::from_static("x-hsp-manifest-cid"),
             head.manifest_cid.as_str(),
         )
         .header(
+            HeaderName::from_static("x-hsp-integrity-hash"),
+            head.integrity_hash.as_str(),
+        )
+        .header(
             HeaderName::from_static("x-hsp-storage-class"),
             head.storage_class.as_str(),
+        )
+        .header(
+            HeaderName::from_static("x-hsp-size-bytes"),
+            head.size_bytes.to_string(),
+        )
+        .header(
+            HeaderName::from_static("x-hsp-ciphertext-size-bytes"),
+            head.ciphertext_size_bytes.to_string(),
         )
         .header(
             HeaderName::from_static("x-hsp-logical-size"),
@@ -627,6 +707,18 @@ fn head_response(
         .header(
             HeaderName::from_static("x-hsp-content-type"),
             head.content_type.as_str(),
+        )
+        .header(
+            HeaderName::from_static("x-hsp-created-at-ms"),
+            head.created_at_ms.to_string(),
+        )
+        .header(
+            HeaderName::from_static("x-hsp-encryption-profile-id"),
+            head.encryption_profile_id.0.as_str(),
+        )
+        .header(
+            HeaderName::from_static("x-hsp-key-policy-id"),
+            head.key_policy_id.0.as_str(),
         )
         .header(
             HeaderName::from_static("x-hsp-metadata-visibility"),
@@ -719,6 +811,17 @@ fn required_header(headers: &http::HeaderMap, name: &str) -> Result<String, ApiE
                 format!("{name} header is required"),
             )
         })
+}
+
+fn require_scope(auth: &AuthContext, scope: CapabilityScope) -> Result<(), ApiError> {
+    if auth.claims.ops.contains(&scope) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ApiErrorCategory::Policy,
+        "missing_required_scope",
+        format!("{} scope is required", scope.as_str()),
+    ))
 }
 
 fn split_namespace_operation(path: &str, marker: &str) -> Result<(String, String), ApiError> {
@@ -1360,6 +1463,32 @@ mod tests {
                 .unwrap(),
             "true"
         );
+        assert_eq!(
+            response.headers().get("x-hsp-integrity-hash").unwrap(),
+            commit.object_cid.as_str()
+        );
+        assert_eq!(response.headers().get("x-hsp-exists").unwrap(), "true");
+
+        let (response, body) = send_request(
+            &mut client,
+            Method::GET,
+            uri_for(
+                handle.local_addr,
+                &format!(
+                    "/v1/objects/cid/{}/metadata?tenant_id=tenant-alpha",
+                    commit.object_cid
+                ),
+            ),
+            read_headers.clone(),
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let metadata: hsp_core::HeadResponse = serde_json::from_slice(&body).unwrap();
+        assert!(metadata.exists);
+        assert!(!metadata.deleted);
+        assert_eq!(metadata.integrity_hash, commit.object_cid);
+        assert_eq!(metadata.ciphertext_size_bytes, chunk_bytes.len() as u64);
 
         let (response, body) = send_request(
             &mut client,
@@ -1403,6 +1532,29 @@ mod tests {
         assert!(lines.contains("\"type\":\"meta\""));
         assert!(lines.contains("\"type\":\"chunk\""));
         assert!(lines.contains("Y2lwaGVydGV4dCE"));
+
+        let metrics_headers = auth_headers(
+            &client.connection,
+            &signing_key,
+            claims(
+                Some("gateway-metrics"),
+                vec![CapabilityScope::Read, CapabilityScope::AdminMetricsRead],
+            ),
+            "gw-metrics",
+        )
+        .await;
+        let (response, body) = send_request(
+            &mut client,
+            Method::GET,
+            uri_for(handle.local_addr, "/metrics"),
+            metrics_headers,
+            &[],
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let metrics = String::from_utf8(body).unwrap();
+        assert!(metrics.contains("hsp_requests_total"));
+        assert!(metrics.contains("operation=\"head\""));
 
         client.shutdown().await;
         handle.shutdown().await;

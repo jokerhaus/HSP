@@ -864,6 +864,9 @@ func decodeHeadResponse(response *http.Response) (protocol.HeadResponse, error) 
 	if err != nil {
 		return protocol.HeadResponse{}, err
 	}
+	sizeBytes := parseOptionalUintHeader(response, "x-hsp-size-bytes", logicalSize)
+	ciphertextSizeBytes := parseOptionalUintHeader(response, "x-hsp-ciphertext-size-bytes", storedSize)
+	createdAtMS := parseOptionalUintHeader(response, "x-hsp-created-at-ms", 0)
 	var resolvedRevision *uint64
 	if response.Header.Get("x-hsp-resolved-revision") != "" {
 		value, err := parseUintHeader(response, "x-hsp-resolved-revision")
@@ -872,18 +875,36 @@ func decodeHeadResponse(response *http.Response) (protocol.HeadResponse, error) 
 		}
 		resolvedRevision = &value
 	}
+	objectCID := response.Header.Get("x-hsp-object-cid")
+	cid := response.Header.Get("x-hsp-cid")
+	if cid == "" {
+		cid = objectCID
+	}
+	integrityHash := response.Header.Get("x-hsp-integrity-hash")
+	if integrityHash == "" {
+		integrityHash = objectCID
+	}
 
 	return protocol.HeadResponse{
-		ObjectCID:                       response.Header.Get("x-hsp-object-cid"),
+		Exists:                          !strings.EqualFold(response.Header.Get("x-hsp-exists"), "false"),
+		Deleted:                         strings.EqualFold(response.Header.Get("x-hsp-deleted"), "true"),
+		CID:                             cid,
+		ObjectCID:                       objectCID,
 		ManifestCID:                     response.Header.Get("x-hsp-manifest-cid"),
+		IntegrityHash:                   integrityHash,
 		StorageClass:                    response.Header.Get("x-hsp-storage-class"),
 		ResolvedNamespace:               response.Header.Get("x-hsp-resolved-namespace"),
 		ResolvedPath:                    response.Header.Get("x-hsp-resolved-path"),
 		ResolvedRevision:                resolvedRevision,
 		ResolvedRecordCID:               response.Header.Get("x-hsp-resolved-record-cid"),
+		SizeBytes:                       sizeBytes,
+		CiphertextSizeBytes:             ciphertextSizeBytes,
 		LogicalSize:                     logicalSize,
 		StoredSize:                      storedSize,
 		ContentType:                     response.Header.Get("x-hsp-content-type"),
+		CreatedAtMS:                     createdAtMS,
+		EncryptionProfileID:             protocol.EncryptionProfileID(response.Header.Get("x-hsp-encryption-profile-id")),
+		KeyPolicyID:                     protocol.KeyPolicyID(response.Header.Get("x-hsp-key-policy-id")),
 		MetadataVisibility:              protocol.VisibilityMode(response.Header.Get("x-hsp-metadata-visibility")),
 		ServerVisibleMetadata:           map[string]string{},
 		EncryptedClientMetadataRedacted: strings.EqualFold(response.Header.Get("x-hsp-encrypted-client-metadata-redacted"), "true"),
@@ -909,6 +930,17 @@ func parseUintHeader(response *http.Response, key string) (uint64, error) {
 		}
 	}
 	return parsed, nil
+}
+
+func parseOptionalUintHeader(response *http.Response, key string, fallback uint64) uint64 {
+	if response.Header.Get(key) == "" {
+		return fallback
+	}
+	value, err := parseUintHeader(response, key)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func selectorObjectPath(selector protocol.ObjectSelector) (string, error) {

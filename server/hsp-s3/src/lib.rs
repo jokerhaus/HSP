@@ -12,7 +12,8 @@ use axum::Router;
 use ed25519_dalek::SigningKey;
 use hsp_auth::{AuthContext, IssuerRegistry};
 use hsp_core::{
-    ApiError, ApiErrorCategory, KeyPolicyId, RangeSpec, VisibilityMode, WrappedObjectKeyRecord,
+    ApiError, ApiErrorCategory, CapabilityScope, KeyPolicyId, RangeSpec, VisibilityMode,
+    WrappedObjectKeyRecord,
 };
 use hsp_crypto::{AwsKmsProviderConfig, LocalDevKms};
 use hsp_distribution::{
@@ -122,6 +123,35 @@ async fn handle_request(
             ))
         }
     };
+
+    if method == Method::GET && path == "/metrics" {
+        let auth =
+            match authenticate_request(&state.service, &method, &path, &query, &headers, &body) {
+                Ok(auth) => auth,
+                Err(error) => return api_error_response(error),
+            };
+        if let Err(error) = require_scope(&auth, CapabilityScope::AdminMetricsRead) {
+            return api_error_response(error);
+        }
+        return text_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4",
+            state.service.prometheus_metrics(),
+        )
+        .unwrap_or_else(api_error_response);
+    }
+    if method == Method::GET && path == "/v1/observability/logs" {
+        let auth =
+            match authenticate_request(&state.service, &method, &path, &query, &headers, &body) {
+                Ok(auth) => auth,
+                Err(error) => return api_error_response(error),
+            };
+        if let Err(error) = require_scope(&auth, CapabilityScope::AdminAuditRead) {
+            return api_error_response(error);
+        }
+        return json_response(StatusCode::OK, &state.service.structured_logs())
+            .unwrap_or_else(api_error_response);
+    }
 
     let resolved =
         match resolve_bucket_and_key(&headers, &uri, state.virtual_host_suffix.as_deref()) {
@@ -908,6 +938,40 @@ fn head_response(head: hsp_distribution::HeadObjectResponse) -> Result<Response<
         .headers_mut()
         .insert("etag", format!("\"{}\"", head.etag).parse().expect("etag"));
     response.headers_mut().insert(
+        "x-hsp-exists",
+        head.exists.to_string().parse().expect("bool"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-deleted",
+        head.deleted.to_string().parse().expect("bool"),
+    );
+    response
+        .headers_mut()
+        .insert("x-hsp-cid", head.cid.parse().expect("cid"));
+    response.headers_mut().insert(
+        "x-hsp-object-cid",
+        head.object_cid.parse().expect("object cid"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-manifest-cid",
+        head.manifest_cid.parse().expect("manifest cid"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-integrity-hash",
+        head.integrity_hash.parse().expect("integrity hash"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-size-bytes",
+        head.size_bytes.to_string().parse().expect("size bytes"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-ciphertext-size-bytes",
+        head.ciphertext_size_bytes
+            .to_string()
+            .parse()
+            .expect("ciphertext size bytes"),
+    );
+    response.headers_mut().insert(
         "content-length",
         head.content_length
             .to_string()
@@ -924,6 +988,38 @@ fn head_response(head: hsp_distribution::HeadObjectResponse) -> Result<Response<
             .to_string()
             .parse()
             .expect("last-modified"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-created-at-ms",
+        head.last_modified_ms
+            .to_string()
+            .parse()
+            .expect("created-at-ms"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-encryption-profile-id",
+        head.encryption_profile_id
+            .0
+            .parse()
+            .expect("encryption profile"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-key-policy-id",
+        head.key_policy_id.0.parse().expect("key policy"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-metadata-visibility",
+        head.metadata_visibility
+            .as_str()
+            .parse()
+            .expect("visibility"),
+    );
+    response.headers_mut().insert(
+        "x-hsp-encrypted-client-metadata-redacted",
+        head.encrypted_client_metadata_redacted
+            .to_string()
+            .parse()
+            .expect("metadata redacted"),
     );
     Ok(response)
 }
@@ -973,6 +1069,33 @@ fn empty_response(status: StatusCode) -> Result<Response<Body>, ApiError> {
         .map_err(http_error)
 }
 
+fn text_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Result<Response<Body>, ApiError> {
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .map_err(http_error)
+}
+
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Result<Response<Body>, ApiError> {
+    let body = serde_json::to_vec(value).map_err(|error| {
+        ApiError::new(
+            ApiErrorCategory::Storage,
+            "json_serialize_failed",
+            error.to_string(),
+        )
+    })?;
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .map_err(http_error)
+}
+
 fn xml_response<T: Serialize>(status: StatusCode, value: &T) -> Result<Response<Body>, ApiError> {
     let xml = to_xml_string(value).map_err(xml_error)?;
     Response::builder()
@@ -1002,6 +1125,17 @@ fn api_error_response(error: ApiError) -> Response<Body> {
         .header("content-type", "application/xml")
         .body(Body::from(body))
         .expect("error response")
+}
+
+fn require_scope(auth: &AuthContext, scope: CapabilityScope) -> Result<(), ApiError> {
+    if auth.claims.ops.contains(&scope) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ApiErrorCategory::Policy,
+        "missing_required_scope",
+        format!("{} scope is required", scope.as_str()),
+    ))
 }
 
 fn trim_etag(value: &str) -> String {

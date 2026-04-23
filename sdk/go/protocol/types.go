@@ -240,16 +240,16 @@ const (
 )
 
 type NamespaceMutationRecord struct {
-	Version    uint8                `json:"version"`
-	TenantID   TenantID             `json:"tenant_id"`
-	Namespace  string               `json:"namespace"`
-	Path       string               `json:"path"`
+	Version    uint8                 `json:"version"`
+	TenantID   TenantID              `json:"tenant_id"`
+	Namespace  string                `json:"namespace"`
+	Path       string                `json:"path"`
 	Kind       NamespaceMutationKind `json:"kind"`
-	TargetCID  string               `json:"target_cid,omitempty"`
-	IfRevision *uint64              `json:"if_revision,omitempty"`
-	TTLMS      *uint64              `json:"ttl_ms,omitempty"`
-	Metadata   map[string]string    `json:"metadata"`
-	IssuedAtMS uint64               `json:"issued_at_ms"`
+	TargetCID  string                `json:"target_cid,omitempty"`
+	IfRevision *uint64               `json:"if_revision,omitempty"`
+	TTLMS      *uint64               `json:"ttl_ms,omitempty"`
+	Metadata   map[string]string     `json:"metadata"`
+	IssuedAtMS uint64                `json:"issued_at_ms"`
 }
 
 type SignedNamespaceMutation struct {
@@ -275,16 +275,16 @@ type ResolveResponse struct {
 }
 
 type BindRequest struct {
-	TenantID       TenantID          `json:"tenant_id"`
-	Namespace      string            `json:"namespace"`
-	Path           string            `json:"path"`
-	TargetCID      string            `json:"target_cid"`
-	IfRevision     *uint64           `json:"if_revision,omitempty"`
-	IfAbsent       bool              `json:"if_absent"`
-	Metadata       map[string]string `json:"metadata"`
-	TTLMS          *uint64           `json:"ttl_ms,omitempty"`
-	IdempotencyKey string            `json:"idempotency_key"`
-	SignedRecordB64 string           `json:"signed_record_b64"`
+	TenantID        TenantID          `json:"tenant_id"`
+	Namespace       string            `json:"namespace"`
+	Path            string            `json:"path"`
+	TargetCID       string            `json:"target_cid"`
+	IfRevision      *uint64           `json:"if_revision,omitempty"`
+	IfAbsent        bool              `json:"if_absent"`
+	Metadata        map[string]string `json:"metadata"`
+	TTLMS           *uint64           `json:"ttl_ms,omitempty"`
+	IdempotencyKey  string            `json:"idempotency_key"`
+	SignedRecordB64 string            `json:"signed_record_b64"`
 }
 
 type BindResponse struct {
@@ -294,13 +294,13 @@ type BindResponse struct {
 }
 
 type UnbindRequest struct {
-	TenantID       TenantID `json:"tenant_id"`
-	Namespace      string   `json:"namespace"`
-	Path           string   `json:"path"`
-	IfRevision     uint64   `json:"if_revision"`
-	HardDelete     bool     `json:"hard_delete"`
-	IdempotencyKey string   `json:"idempotency_key"`
-	SignedRecordB64 string  `json:"signed_record_b64"`
+	TenantID        TenantID `json:"tenant_id"`
+	Namespace       string   `json:"namespace"`
+	Path            string   `json:"path"`
+	IfRevision      uint64   `json:"if_revision"`
+	HardDelete      bool     `json:"hard_delete"`
+	IdempotencyKey  string   `json:"idempotency_key"`
+	SignedRecordB64 string   `json:"signed_record_b64"`
 }
 
 type UnbindResponse struct {
@@ -341,12 +341,12 @@ type ListResponse struct {
 type EventType string
 
 const (
-	EventTypeObjectCommitted    EventType = "object.committed"
-	EventTypeNamespaceBound     EventType = "namespace.bound"
-	EventTypeNamespaceUnbound   EventType = "namespace.unbound"
+	EventTypeObjectCommitted     EventType = "object.committed"
+	EventTypeNamespaceBound      EventType = "namespace.bound"
+	EventTypeNamespaceUnbound    EventType = "namespace.unbound"
 	EventTypeNamespaceTombstoned EventType = "namespace.tombstoned"
-	EventTypeAuthDenied         EventType = "auth.denied"
-	EventTypePinAccepted        EventType = "pin.accepted"
+	EventTypeAuthDenied          EventType = "auth.denied"
+	EventTypePinAccepted         EventType = "pin.accepted"
 )
 
 type EventRecord struct {
@@ -471,19 +471,28 @@ type HeadRequest struct {
 }
 
 type HeadResponse struct {
-	ObjectCID                       string            `json:"object_cid"`
-	ManifestCID                     string            `json:"manifest_cid"`
-	StorageClass                    string            `json:"storage_class"`
-	ResolvedNamespace               string            `json:"resolved_namespace,omitempty"`
-	ResolvedPath                    string            `json:"resolved_path,omitempty"`
-	ResolvedRevision                *uint64           `json:"resolved_revision,omitempty"`
-	ResolvedRecordCID               string            `json:"resolved_record_cid,omitempty"`
-	LogicalSize                     uint64            `json:"logical_size"`
-	StoredSize                      uint64            `json:"stored_size"`
-	ContentType                     string            `json:"content_type"`
-	MetadataVisibility              VisibilityMode    `json:"metadata_visibility"`
-	ServerVisibleMetadata           map[string]string `json:"server_visible_metadata"`
-	EncryptedClientMetadataRedacted bool              `json:"encrypted_client_metadata_redacted"`
+	Exists                          bool                `json:"exists"`
+	Deleted                         bool                `json:"deleted"`
+	CID                             string              `json:"cid"`
+	ObjectCID                       string              `json:"object_cid"`
+	ManifestCID                     string              `json:"manifest_cid"`
+	IntegrityHash                   string              `json:"integrity_hash"`
+	StorageClass                    string              `json:"storage_class"`
+	ResolvedNamespace               string              `json:"resolved_namespace,omitempty"`
+	ResolvedPath                    string              `json:"resolved_path,omitempty"`
+	ResolvedRevision                *uint64             `json:"resolved_revision,omitempty"`
+	ResolvedRecordCID               string              `json:"resolved_record_cid,omitempty"`
+	SizeBytes                       uint64              `json:"size_bytes"`
+	CiphertextSizeBytes             uint64              `json:"ciphertext_size_bytes"`
+	LogicalSize                     uint64              `json:"logical_size"`
+	StoredSize                      uint64              `json:"stored_size"`
+	ContentType                     string              `json:"content_type"`
+	CreatedAtMS                     uint64              `json:"created_at_ms"`
+	EncryptionProfileID             EncryptionProfileID `json:"encryption_profile_id"`
+	KeyPolicyID                     KeyPolicyID         `json:"key_policy_id"`
+	MetadataVisibility              VisibilityMode      `json:"metadata_visibility"`
+	ServerVisibleMetadata           map[string]string   `json:"server_visible_metadata"`
+	EncryptedClientMetadataRedacted bool                `json:"encrypted_client_metadata_redacted"`
 }
 
 type GetRequest struct {
@@ -505,16 +514,25 @@ type GetChunkDescriptor struct {
 }
 
 type GetResponseMeta struct {
+	Exists                          bool                 `json:"exists"`
+	Deleted                         bool                 `json:"deleted"`
+	CID                             string               `json:"cid"`
 	ObjectCID                       string               `json:"object_cid"`
 	ManifestCID                     string               `json:"manifest_cid"`
+	IntegrityHash                   string               `json:"integrity_hash"`
 	StorageClass                    string               `json:"storage_class"`
 	ResolvedNamespace               string               `json:"resolved_namespace,omitempty"`
 	ResolvedPath                    string               `json:"resolved_path,omitempty"`
 	ResolvedRevision                *uint64              `json:"resolved_revision,omitempty"`
 	ResolvedRecordCID               string               `json:"resolved_record_cid,omitempty"`
+	SizeBytes                       uint64               `json:"size_bytes"`
+	CiphertextSizeBytes             uint64               `json:"ciphertext_size_bytes"`
 	LogicalSize                     uint64               `json:"logical_size"`
 	StoredSize                      uint64               `json:"stored_size"`
 	ContentType                     string               `json:"content_type"`
+	CreatedAtMS                     uint64               `json:"created_at_ms"`
+	EncryptionProfileID             EncryptionProfileID  `json:"encryption_profile_id"`
+	KeyPolicyID                     KeyPolicyID          `json:"key_policy_id"`
 	MetadataVisibility              VisibilityMode       `json:"metadata_visibility"`
 	ServerVisibleMetadata           map[string]string    `json:"server_visible_metadata"`
 	EncryptedClientMetadataRedacted bool                 `json:"encrypted_client_metadata_redacted"`

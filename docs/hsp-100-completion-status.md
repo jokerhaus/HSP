@@ -33,6 +33,16 @@
 - Crypto quality:
   - added explicit `rewrap_store_envelope_preserves_plaintext` regression test
     so key-recovery evidence is anchored to executable coverage
+- Production storage integration:
+  - added first-class existence and integrity metadata without object download:
+    `exists`, `deleted`, `cid`, `integrity_hash`, `size_bytes`,
+    `ciphertext_size_bytes`, `created_at_ms`, `encryption_profile_id`, and
+    `key_policy_id`
+  - added gateway JSON metadata endpoints for CID and namespace selectors
+  - added Prometheus metrics and structured secret-aware logs for `put`, `get`,
+    `delete`, `auth_denied`, `kms_error`, and `integrity_error`
+  - tightened chunk ingest integrity so `PUT_CHUNK` rejects ciphertext bytes
+    whose computed CID does not match the declared chunk CID
 
 ## Local Verification Baseline
 

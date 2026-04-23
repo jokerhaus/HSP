@@ -21,7 +21,7 @@ use hsp_crypto::{
     StoredEnvelope,
 };
 use hsp_path::canonical_path;
-use hsp_service::{AlphaConfig, AlphaService};
+use hsp_service::{AlphaConfig, AlphaService, ServiceMetricSnapshot, StructuredLogRecord};
 use http::HeaderMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -292,14 +292,22 @@ pub struct HeadObjectRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadObjectResponse {
+    pub exists: bool,
+    pub deleted: bool,
+    pub cid: String,
     pub bucket: String,
     pub key: String,
     pub object_cid: String,
     pub manifest_cid: String,
+    pub integrity_hash: String,
     pub etag: String,
+    pub size_bytes: u64,
+    pub ciphertext_size_bytes: u64,
     pub content_length: u64,
     pub content_type: String,
     pub last_modified_ms: u64,
+    pub encryption_profile_id: EncryptionProfileId,
+    pub key_policy_id: KeyPolicyId,
     pub server_visible_metadata: BTreeMap<String, String>,
     pub encrypted_client_metadata_redacted: bool,
     pub metadata_visibility: VisibilityMode,
@@ -544,6 +552,18 @@ impl DistributionService {
         };
         service.ensure_store_roots()?;
         Ok(service)
+    }
+
+    pub fn metrics_snapshot(&self) -> ServiceMetricSnapshot {
+        self.alpha.metrics_snapshot()
+    }
+
+    pub fn prometheus_metrics(&self) -> String {
+        self.alpha.prometheus_metrics()
+    }
+
+    pub fn structured_logs(&self) -> Vec<StructuredLogRecord> {
+        self.alpha.structured_logs()
     }
 
     pub fn alpha(&self) -> &AlphaService {
@@ -1388,14 +1408,22 @@ impl DistributionService {
             )
         })?;
         Ok(HeadObjectResponse {
+            exists: manifest_only.meta.exists,
+            deleted: manifest_only.meta.deleted,
+            cid: manifest_only.meta.cid.clone(),
             bucket: bucket.bucket,
             key,
             object_cid: manifest_only.meta.object_cid.clone(),
             manifest_cid: manifest_only.meta.manifest_cid.clone(),
+            integrity_hash: manifest_only.meta.integrity_hash.clone(),
             etag: manifest_only.meta.object_cid,
+            size_bytes: manifest_only.meta.size_bytes,
+            ciphertext_size_bytes: manifest_only.meta.ciphertext_size_bytes,
             content_length: manifest_only.meta.stored_size,
             content_type: manifest_only.meta.content_type,
             last_modified_ms: manifest.created_at_ms,
+            encryption_profile_id: manifest_only.meta.encryption_profile_id,
+            key_policy_id: manifest_only.meta.key_policy_id,
             server_visible_metadata: manifest_only.meta.server_visible_metadata,
             encrypted_client_metadata_redacted: manifest_only
                 .meta
@@ -1437,14 +1465,22 @@ impl DistributionService {
             })?;
             (
                 HeadObjectResponse {
+                    exists: manifest_only.meta.exists,
+                    deleted: manifest_only.meta.deleted,
+                    cid: manifest_only.meta.cid.clone(),
                     bucket: request.bucket.clone().unwrap_or_default(),
                     key: request.key.clone().unwrap_or_else(|| cid.clone()),
                     object_cid: manifest_only.meta.object_cid.clone(),
                     manifest_cid: manifest_only.meta.manifest_cid.clone(),
+                    integrity_hash: manifest_only.meta.integrity_hash.clone(),
                     etag: manifest_only.meta.object_cid.clone(),
+                    size_bytes: manifest_only.meta.size_bytes,
+                    ciphertext_size_bytes: manifest_only.meta.ciphertext_size_bytes,
                     content_length: manifest_only.meta.stored_size,
                     content_type: manifest_only.meta.content_type,
                     last_modified_ms: manifest.created_at_ms,
+                    encryption_profile_id: manifest_only.meta.encryption_profile_id,
+                    key_policy_id: manifest_only.meta.key_policy_id,
                     server_visible_metadata: manifest_only.meta.server_visible_metadata,
                     encrypted_client_metadata_redacted: manifest_only
                         .meta

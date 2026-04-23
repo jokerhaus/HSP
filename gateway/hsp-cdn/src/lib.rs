@@ -138,6 +138,35 @@ async fn handle_request(
         }
     };
 
+    if method == Method::GET && path == "/metrics" {
+        let auth =
+            match authenticate_request(&state.service, &method, &path, &query, &headers, &body) {
+                Ok(auth) => auth,
+                Err(error) => return api_error_response(error),
+            };
+        if let Err(error) = require_scope(&auth, CapabilityScope::AdminMetricsRead) {
+            return api_error_response(error);
+        }
+        return text_response(
+            StatusCode::OK,
+            "text/plain; version=0.0.4",
+            state.service.prometheus_metrics(),
+        )
+        .unwrap_or_else(api_error_response);
+    }
+    if method == Method::GET && path == "/v1/observability/logs" {
+        let auth =
+            match authenticate_request(&state.service, &method, &path, &query, &headers, &body) {
+                Ok(auth) => auth,
+                Err(error) => return api_error_response(error),
+            };
+        if let Err(error) = require_scope(&auth, CapabilityScope::AdminAuditRead) {
+            return api_error_response(error);
+        }
+        return json_response(StatusCode::OK, &state.service.structured_logs())
+            .unwrap_or_else(api_error_response);
+    }
+
     let auth = match authenticate_request(&state.service, &method, &path, &query, &headers, &body) {
         Ok(auth) => auth,
         Err(error) => return api_error_response(error),
@@ -392,6 +421,33 @@ fn cached_response(
     Ok(response)
 }
 
+fn text_response(
+    status: StatusCode,
+    content_type: &'static str,
+    body: String,
+) -> Result<Response<Body>, ApiError> {
+    Response::builder()
+        .status(status)
+        .header("content-type", content_type)
+        .body(Body::from(body))
+        .map_err(http_error)
+}
+
+fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Result<Response<Body>, ApiError> {
+    let body = serde_json::to_vec(value).map_err(|error| {
+        ApiError::new(
+            ApiErrorCategory::Storage,
+            "json_serialize_failed",
+            error.to_string(),
+        )
+    })?;
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .map_err(http_error)
+}
+
 fn origin_response(
     method: &Method,
     response: &hsp_distribution::GetObjectResponse,
@@ -407,7 +463,41 @@ fn origin_response(
         .header("content-type", response.head.content_type.as_str())
         .header("content-length", response.body.len().to_string())
         .header("cache-control", response.cache_control.as_str())
-        .header("x-hsp-cache-status", cache_status);
+        .header("x-hsp-cache-status", cache_status)
+        .header("x-hsp-exists", response.head.exists.to_string())
+        .header("x-hsp-deleted", response.head.deleted.to_string())
+        .header("x-hsp-cid", response.head.cid.as_str())
+        .header("x-hsp-object-cid", response.head.object_cid.as_str())
+        .header("x-hsp-manifest-cid", response.head.manifest_cid.as_str())
+        .header(
+            "x-hsp-integrity-hash",
+            response.head.integrity_hash.as_str(),
+        )
+        .header("x-hsp-size-bytes", response.head.size_bytes.to_string())
+        .header(
+            "x-hsp-ciphertext-size-bytes",
+            response.head.ciphertext_size_bytes.to_string(),
+        )
+        .header(
+            "x-hsp-created-at-ms",
+            response.head.last_modified_ms.to_string(),
+        )
+        .header(
+            "x-hsp-encryption-profile-id",
+            response.head.encryption_profile_id.0.as_str(),
+        )
+        .header(
+            "x-hsp-key-policy-id",
+            response.head.key_policy_id.0.as_str(),
+        )
+        .header(
+            "x-hsp-metadata-visibility",
+            response.head.metadata_visibility.as_str(),
+        )
+        .header(
+            "x-hsp-encrypted-client-metadata-redacted",
+            response.head.encrypted_client_metadata_redacted.to_string(),
+        );
     if let Some(content_range) = &response.content_range {
         builder = builder.header("content-range", content_range.as_str());
     }
@@ -418,6 +508,17 @@ fn origin_response(
             Body::from(response.body.clone())
         })
         .map_err(http_error)
+}
+
+fn require_scope(auth: &hsp_auth::AuthContext, scope: CapabilityScope) -> Result<(), ApiError> {
+    if auth.claims.ops.contains(&scope) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ApiErrorCategory::Policy,
+        "missing_required_scope",
+        format!("{} scope is required", scope.as_str()),
+    ))
 }
 
 fn is_cacheable(response: &hsp_distribution::GetObjectResponse) -> bool {
@@ -719,14 +820,22 @@ mod tests {
     fn plaintext_responses_are_not_cacheable() {
         let response = hsp_distribution::GetObjectResponse {
             head: hsp_distribution::HeadObjectResponse {
+                exists: true,
+                deleted: false,
+                cid: "cid-1".to_string(),
                 bucket: "media".to_string(),
                 key: "plain.txt".to_string(),
                 object_cid: "cid-1".to_string(),
                 manifest_cid: "cid-1".to_string(),
+                integrity_hash: "cid-1".to_string(),
                 etag: "cid-1".to_string(),
+                size_bytes: 5,
+                ciphertext_size_bytes: 5,
                 content_length: 5,
                 content_type: "text/plain".to_string(),
                 last_modified_ms: now_ms(),
+                encryption_profile_id: hsp_core::EncryptionProfileId("trusted-edge-v1".to_string()),
+                key_policy_id: hsp_core::KeyPolicyId("policy-default".to_string()),
                 server_visible_metadata: BTreeMap::new(),
                 encrypted_client_metadata_redacted: true,
                 metadata_visibility: hsp_core::VisibilityMode::Split,
