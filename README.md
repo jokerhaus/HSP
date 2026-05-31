@@ -157,7 +157,7 @@ Production observability is first-class and secret-aware:
 ## Toolchains
 
 - Rust stable with `rustfmt` and `clippy`
-- Go 1.25.9 via `go.work` / module `toolchain` directives
+- Go 1.25.10 via `go.work` / module `toolchain` directives
 
 ## Release Gates
 
@@ -167,7 +167,7 @@ and in CI:
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit`
-- `GOTOOLCHAIN=go1.25.9+auto go work sync`
+- `GOTOOLCHAIN=go1.25.10+auto go work sync`
 - `go test ./sdk/go/... ./cli/hspctl/...`
 - `govulncheck ./...` in `sdk/go` and `cli/hspctl`
 - `cargo run -p hsp-conformance`

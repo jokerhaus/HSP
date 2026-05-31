@@ -33,6 +33,7 @@ pub struct NativeBetaConfig {
     pub root_dir: PathBuf,
     pub issuer_registry_path: PathBuf,
     pub server_instance_id: String,
+    pub kms_seed: Vec<u8>,
 }
 
 pub struct NativeBetaServerHandle {
@@ -45,6 +46,22 @@ pub struct NativeBetaServerHandle {
 struct NativeState {
     service: Arc<AlphaService>,
     issuer_registry: Arc<IssuerRegistry>,
+}
+
+fn native_runtime_kms(seed: &[u8]) -> Result<hsp_crypto::LocalDevKms, ApiError> {
+    let seed = hsp_crypto::validate_runtime_secret_bytes(
+        "HSP_KMS_SEED",
+        seed,
+        hsp_crypto::DEFAULT_KMS_SEED_LITERALS,
+    )
+    .map_err(|error| {
+        hsp_crypto::crypto_error_to_api(
+            error,
+            "HSP_KMS_SEED must be configured for native beta runtime KMS",
+        )
+    })?;
+    hsp_crypto::LocalDevKms::from_seed(&seed)
+        .map_err(|error| hsp_crypto::crypto_error_to_api(error, "failed to initialize native KMS"))
 }
 
 impl NativeBetaServerHandle {
@@ -71,11 +88,7 @@ pub async fn spawn_native_beta_server(
                 native_port: local_addr.port(),
                 server_instance_id: config.server_instance_id.clone(),
             },
-            hsp_crypto::LocalDevKms::from_seed(b"hsp-secure-alpha-local-seed").map_err(
-                |error| {
-                    hsp_crypto::crypto_error_to_api(error, "failed to initialize local dev KMS")
-                },
-            )?,
+            native_runtime_kms(&config.kms_seed)?,
         )?
         .with_issuer_registry((*issuer_registry).clone()),
     );
@@ -566,6 +579,13 @@ mod tests {
         root
     }
 
+    #[test]
+    fn native_runtime_kms_rejects_legacy_default_seed() {
+        let error = native_runtime_kms(b"hsp-secure-alpha-local-seed").unwrap_err();
+        assert_eq!(error.category, hsp_core::ApiErrorCategory::Policy);
+        assert_eq!(error.code, "crypto_error");
+    }
+
     fn write_registry(root: &Path) -> (PathBuf, SigningKey) {
         let signing_key = SigningKey::from_bytes(&[7u8; 32]);
         let registry_path = root.join("issuer-registry.json");
@@ -733,6 +753,7 @@ mod tests {
             root_dir: root.clone(),
             issuer_registry_path: registry_path,
             server_instance_id: "native-info".to_string(),
+            kms_seed: b"native-info-test-kms-seed-00000001".to_vec(),
         })
         .await
         .unwrap();
@@ -775,6 +796,7 @@ mod tests {
             root_dir: root.clone(),
             issuer_registry_path: registry_path,
             server_instance_id: "native-upload".to_string(),
+            kms_seed: b"native-upload-test-kms-seed-000001".to_vec(),
         })
         .await
         .unwrap();
@@ -926,6 +948,7 @@ mod tests {
             root_dir: root.clone(),
             issuer_registry_path: registry_path,
             server_instance_id: "native-namespace".to_string(),
+            kms_seed: b"native-namespace-test-kms-seed-01".to_vec(),
         })
         .await
         .unwrap();
@@ -1332,6 +1355,7 @@ mod tests {
             root_dir: root.clone(),
             issuer_registry_path: registry_path,
             server_instance_id: "native-authority".to_string(),
+            kms_seed: b"native-authority-test-kms-seed-01".to_vec(),
         })
         .await
         .unwrap();

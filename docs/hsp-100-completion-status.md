@@ -6,7 +6,7 @@
   - expanded `.github/workflows/ci.yml` with Rust tests, `clippy`, `cargo audit`,
     Go tests, `govulncheck`, black-box conformance, SBOM generation, and PR
     dependency review
-  - normalized Go release baseline to `go1.25.9`
+  - normalized Go release baseline to `go1.25.10`
 - Conformance and adversarial coverage:
   - widened `hsp-conformance` to cover S3 compatibility smoke:
     - `ListObjectsV2`
@@ -49,10 +49,10 @@
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit`
-- `cd sdk/go && GOTOOLCHAIN=go1.25.9+auto go test ./...`
-- `cd cli/hspctl && GOTOOLCHAIN=go1.25.9+auto go test ./...`
-- `cd sdk/go && GOTOOLCHAIN=go1.25.9+auto govulncheck ./...`
-- `cd cli/hspctl && GOTOOLCHAIN=go1.25.9+auto govulncheck ./...`
+- `cd sdk/go && GOTOOLCHAIN=go1.25.10+auto go test ./...`
+- `cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto go test ./...`
+- `cd sdk/go && GOTOOLCHAIN=go1.25.10+auto govulncheck ./...`
+- `cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto govulncheck ./...`
 - `cargo run -p hsp-conformance`
 
 ## Remaining For Strict Production Sign-Off

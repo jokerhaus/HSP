@@ -1,12 +1,14 @@
 use std::env;
+use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use hsp_crypto::{required_runtime_secret_from_env, DEFAULT_KMS_SEED_LITERALS};
 use hsp_gw::spawn_gateway_beta_server;
 use hsp_service::default_alpha_service;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let root = env::var("HSP_ALPHA_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(".hsp-alpha"));
@@ -14,7 +16,7 @@ async fn main() {
         .nth(1)
         .unwrap_or_else(|| "bootstrap".to_string());
 
-    let service = default_alpha_service(root).expect("failed to initialize secure alpha service");
+    let service = default_alpha_service(root)?;
 
     match command.as_str() {
         "serve" => {
@@ -38,6 +40,8 @@ async fn main() {
                 .ok()
                 .and_then(|value| value.parse::<u16>().ok())
                 .unwrap_or(9443);
+            let kms_seed =
+                required_runtime_secret_from_env("HSP_KMS_SEED", DEFAULT_KMS_SEED_LITERALS)?;
 
             let handle = spawn_gateway_beta_server(hsp_gw::GatewayBetaConfig {
                 bind_addr,
@@ -49,9 +53,9 @@ async fn main() {
                 issuer_registry_path,
                 server_instance_id,
                 native_port,
+                kms_seed,
             })
-            .await
-            .expect("failed to start gateway beta server");
+            .await?;
             println!("{{\"bind_addr\":\"{}\"}}", handle.local_addr);
             std::future::pending::<()>().await;
         }
@@ -71,4 +75,5 @@ async fn main() {
                 .expect("failed to serialize bootstrap document")
         ),
     }
+    Ok(())
 }

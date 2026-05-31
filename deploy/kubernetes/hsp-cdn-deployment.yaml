@@ -21,8 +21,16 @@ spec:
               value: /var/lib/hsp
             - name: HSP_ISSUER_REGISTRY
               value: /etc/hsp/issuer-registry.json
-            - name: HSP_KMS_URI
-              value: "kms://workload-identity/public-multi-tenant"
+            - name: HSP_KMS_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: hsp-runtime-secrets
+                  key: storage-kms-seed
+            - name: HSP_EDGE_SIGNING_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: hsp-runtime-secrets
+                  key: edge-signing-secret
           ports:
             - containerPort: 8082
           volumeMounts:

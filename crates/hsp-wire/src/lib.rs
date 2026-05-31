@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 const FRAME_HEADER_LEN: usize = 5;
 const MAX_CONTROL_FRAME_LEN: usize = 8 * 1024 * 1024;
+/// Protocol DATA frame cap aligned with the advertised public beta max_chunk_size.
+pub const MAX_DATA_FRAME_LEN: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -119,9 +121,11 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     frame: &Frame,
 ) -> Result<(), WireCodecError> {
+    let frame_type = frame.frame_type();
     let payload = encode_frame_payload(frame)?;
+    enforce_frame_len(frame_type, payload.len())?;
     let mut header = [0u8; FRAME_HEADER_LEN];
-    header[0] = frame.frame_type() as u8;
+    header[0] = frame_type as u8;
     header[1..].copy_from_slice(&(payload.len() as u32).to_be_bytes());
     writer.write_all(&header).await?;
     if !payload.is_empty() {
@@ -137,19 +141,24 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Frame, W
     let frame_type = FrameType::try_from(header[0])?;
     let length = u32::from_be_bytes(header[1..].try_into().expect("header length")) as usize;
 
-    let max_len = match frame_type {
-        FrameType::Data => usize::MAX,
-        _ => MAX_CONTROL_FRAME_LEN,
-    };
-    if length > max_len {
-        return Err(WireCodecError::OversizedFrame { frame_type, length });
-    }
+    enforce_frame_len(frame_type, length)?;
 
     let mut payload = vec![0u8; length];
     if length > 0 {
         reader.read_exact(&mut payload).await?;
     }
     decode_frame_payload(frame_type, &payload)
+}
+
+fn enforce_frame_len(frame_type: FrameType, length: usize) -> Result<(), WireCodecError> {
+    let max_len = match frame_type {
+        FrameType::Data => MAX_DATA_FRAME_LEN,
+        _ => MAX_CONTROL_FRAME_LEN,
+    };
+    if length > max_len {
+        return Err(WireCodecError::OversizedFrame { frame_type, length });
+    }
+    Ok(())
 }
 
 fn encode_frame_payload(frame: &Frame) -> Result<Vec<u8>, WireCodecError> {
@@ -353,6 +362,25 @@ mod tests {
             .unwrap();
         let error = read_frame(&mut server).await.unwrap_err();
         assert!(error.to_string().contains("END frame"));
+    }
+
+    #[tokio::test]
+    async fn data_frame_rejects_oversized_length_before_payload_read() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let oversized_len = MAX_DATA_FRAME_LEN + 1;
+        let mut header = [0u8; FRAME_HEADER_LEN];
+        header[0] = FrameType::Data as u8;
+        header[1..].copy_from_slice(&(oversized_len as u32).to_be_bytes());
+        client.write_all(&header).await.unwrap();
+
+        let error = read_frame(&mut server).await.unwrap_err();
+        assert!(matches!(
+            error,
+            WireCodecError::OversizedFrame {
+                frame_type: FrameType::Data,
+                length
+            } if length == oversized_len
+        ));
     }
 
     #[test]

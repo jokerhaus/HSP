@@ -1645,7 +1645,7 @@ mod tests {
             issuer_registry_path: registry_path,
             namespace_signing_seed: [21u8; 32],
             namespace_signing_key_id: "dist-key".to_string(),
-            edge_signing_secret: b"edge-secret".to_vec(),
+            edge_signing_secret: b"s3-test-edge-secret-000000000001".to_vec(),
             kms_seed: b"hsp-s3-runtime-seed".to_vec(),
             aws_kms: None,
             virtual_host_suffix: None,

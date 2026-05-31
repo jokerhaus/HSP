@@ -18,8 +18,11 @@ spec:
           image: ghcr.io/example/hsp/hspd:0.1.0
           args: ["--profile=public-multi-tenant"]
           env:
-            - name: HSP_KMS_URI
-              value: "kms://workload-identity/public-multi-tenant"
+            - name: HSP_KMS_SEED
+              valueFrom:
+                secretKeyRef:
+                  name: hsp-runtime-secrets
+                  key: storage-kms-seed
           ports:
             - containerPort: 443
           securityContext:
@@ -30,4 +33,3 @@ spec:
               drop: ["ALL"]
             seccompProfile:
               type: RuntimeDefault
-

@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use hsp_cdn::{run_cdn_server, CdnServerConfig};
 use hsp_crypto::AwsKmsProviderConfig;
+use hsp_crypto::{
+    required_runtime_secret_from_env, DEFAULT_EDGE_SIGNING_SECRET_LITERALS,
+    DEFAULT_KMS_SEED_LITERALS,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -15,10 +19,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         env::var("HSP_ISSUER_REGISTRY")
             .unwrap_or_else(|_| "./deploy/issuer-registry.dev.json".to_string()),
     );
-    let namespace_signing_seed = env::var("HSP_DISTRIBUTION_SIGNING_SEED")
-        .ok()
-        .and_then(|value| parse_hex_32(&value))
-        .unwrap_or([33u8; 32]);
+    let namespace_signing_seed = parse_hex_32(
+        &env::var("HSP_DISTRIBUTION_SIGNING_SEED")
+            .map_err(|_| "HSP_DISTRIBUTION_SIGNING_SEED must be configured explicitly")?,
+    )
+    .ok_or("HSP_DISTRIBUTION_SIGNING_SEED must be a 64-character hex string")?;
 
     run_cdn_server(CdnServerConfig {
         bind_addr,
@@ -42,12 +47,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         namespace_signing_seed,
         namespace_signing_key_id: env::var("HSP_DISTRIBUTION_SIGNING_KEY_ID")
             .unwrap_or_else(|_| "dist-key".to_string()),
-        edge_signing_secret: env::var("HSP_EDGE_SIGNING_SECRET")
-            .unwrap_or_else(|_| "edge-secret".to_string())
-            .into_bytes(),
-        kms_seed: env::var("HSP_KMS_SEED")
-            .unwrap_or_else(|_| "hsp-cdn-runtime-seed".to_string())
-            .into_bytes(),
+        edge_signing_secret: required_runtime_secret_from_env(
+            "HSP_EDGE_SIGNING_SECRET",
+            DEFAULT_EDGE_SIGNING_SECRET_LITERALS,
+        )?,
+        kms_seed: required_runtime_secret_from_env("HSP_KMS_SEED", DEFAULT_KMS_SEED_LITERALS)?,
         aws_kms: aws_kms_config_from_env(),
     })
     .await
@@ -76,4 +80,31 @@ fn aws_kms_config_from_env() -> Option<AwsKmsProviderConfig> {
         region,
         workload_identity_required,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use hsp_crypto::CryptoError;
+
+    #[test]
+    fn cdn_runtime_secrets_reject_legacy_defaults() {
+        assert_eq!(
+            hsp_crypto::validate_runtime_secret(
+                "HSP_EDGE_SIGNING_SECRET",
+                "edge-secret",
+                hsp_crypto::DEFAULT_EDGE_SIGNING_SECRET_LITERALS,
+            )
+            .unwrap_err(),
+            CryptoError::WeakRuntimeSecret("HSP_EDGE_SIGNING_SECRET")
+        );
+        assert_eq!(
+            hsp_crypto::validate_runtime_secret(
+                "HSP_KMS_SEED",
+                "hsp-cdn-runtime-seed",
+                hsp_crypto::DEFAULT_KMS_SEED_LITERALS,
+            )
+            .unwrap_err(),
+            CryptoError::WeakRuntimeSecret("HSP_KMS_SEED")
+        );
+    }
 }

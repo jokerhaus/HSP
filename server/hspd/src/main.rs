@@ -1,18 +1,20 @@
 use std::env;
+use std::error::Error;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use hsp_crypto::{required_runtime_secret_from_env, DEFAULT_KMS_SEED_LITERALS};
 use hsp_service::default_alpha_service;
 use hspd::spawn_native_beta_server;
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let root = env::var("HSP_ALPHA_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(".hsp-alpha"));
     let command = env::args().nth(1).unwrap_or_else(|| "info".to_string());
 
-    let service = default_alpha_service(root).expect("failed to initialize secure alpha service");
+    let service = default_alpha_service(root)?;
 
     match command.as_str() {
         "serve" => {
@@ -32,6 +34,8 @@ async fn main() {
                 .unwrap_or_else(|_| PathBuf::from(".hsp-alpha/issuer-registry.json"));
             let server_instance_id = env::var("HSP_SERVER_INSTANCE_ID")
                 .unwrap_or_else(|_| "hsp-native-beta".to_string());
+            let kms_seed =
+                required_runtime_secret_from_env("HSP_KMS_SEED", DEFAULT_KMS_SEED_LITERALS)?;
 
             let handle = spawn_native_beta_server(hspd::NativeBetaConfig {
                 bind_addr,
@@ -42,9 +46,9 @@ async fn main() {
                     .unwrap_or_else(|_| PathBuf::from(".hsp-alpha")),
                 issuer_registry_path,
                 server_instance_id,
+                kms_seed,
             })
-            .await
-            .expect("failed to start native beta server");
+            .await?;
             println!("{{\"bind_addr\":\"{}\"}}", handle.local_addr);
             std::future::pending::<()>().await;
         }
@@ -70,4 +74,5 @@ async fn main() {
             );
         }
     }
+    Ok(())
 }

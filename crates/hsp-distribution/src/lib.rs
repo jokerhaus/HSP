@@ -18,9 +18,9 @@ use hsp_core::{
 };
 use hsp_crypto::{
     crypto_error_to_api, AwsKmsProvider, AwsKmsProviderConfig, KmsProvider, LocalDevKms,
-    StoredEnvelope,
+    StoredEnvelope, DEFAULT_EDGE_SIGNING_SECRET_LITERALS, MIN_RUNTIME_SECRET_BYTES,
 };
-use hsp_path::canonical_path;
+use hsp_path::{canonical_path, segment_prefix_matches};
 use hsp_service::{AlphaConfig, AlphaService, ServiceMetricSnapshot, StructuredLogRecord};
 use http::HeaderMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -496,6 +496,41 @@ pub struct HttpRequestBinding<'a> {
     pub body: &'a [u8],
 }
 
+pub fn canonical_bucket_name(bucket: &str) -> Result<String, ApiError> {
+    if bucket.trim().is_empty() || bucket.contains('/') {
+        return Err(ApiError::new(
+            ApiErrorCategory::Validation,
+            "invalid_bucket",
+            "bucket name must be non-empty and must not contain '/'",
+        ));
+    }
+    let canonical = canonical_path(bucket).map_err(|error| {
+        ApiError::new(
+            ApiErrorCategory::Validation,
+            "invalid_bucket",
+            error.to_string(),
+        )
+    })?;
+    if canonical.trim().is_empty() || canonical.contains('/') {
+        return Err(ApiError::new(
+            ApiErrorCategory::Validation,
+            "invalid_bucket",
+            "bucket name must remain a single canonical segment after percent-decoding",
+        ));
+    }
+    Ok(canonical)
+}
+
+pub fn canonical_object_key_name(key: &str) -> Result<String, ApiError> {
+    canonical_path(key).map_err(|error| {
+        ApiError::new(
+            ApiErrorCategory::Validation,
+            "invalid_object_key",
+            error.to_string(),
+        )
+    })
+}
+
 #[derive(Debug)]
 pub struct DistributionService {
     config: DistributionConfig,
@@ -518,6 +553,7 @@ impl DistributionService {
         edge_signing_secret: Vec<u8>,
     ) -> Result<Self, ApiError> {
         let namespace_signing_key_id = namespace_signing_key_id.into();
+        validate_edge_signing_secret(&edge_signing_secret)?;
         if issuer_registry
             .resolve_key_id(namespace_signing_key_id.as_bytes())
             .is_none()
@@ -533,7 +569,7 @@ impl DistributionService {
             .with_issuer_registry(issuer_registry.clone());
         let store_kms: Box<dyn KmsProvider> = if let Some(aws) = config.aws_kms.clone() {
             Box::new(
-                AwsKmsProvider::new(aws, b"hsp-aws-kms-fallback-seed").map_err(|error| {
+                AwsKmsProvider::with_local_fallback(aws, kms.clone()).map_err(|error| {
                     crypto_error_to_api(error, "failed to initialize AWS KMS adapter")
                 })?,
             )
@@ -592,8 +628,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<BucketRecord, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), None)?;
         if self.bucket_record(&tenant_id, &bucket)?.is_some() {
             return Err(ApiError::new(
                 ApiErrorCategory::Conflict,
@@ -668,8 +704,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<(), ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), None)?;
         let _ = self.head_bucket(auth, tenant_id.clone(), bucket.clone())?;
 
         let objects = self.alpha.list(
@@ -716,8 +752,8 @@ impl DistributionService {
         bucket: impl Into<String>,
         acl: CannedAcl,
     ) -> Result<BucketAclRecord, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), None)?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         let record = BucketAclRecord {
             tenant_id: tenant_id.clone(),
@@ -740,8 +776,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<BucketAclRecord, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &bucket, None)?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         Ok(self
             .read_encrypted_json::<BucketAclRecord>(
@@ -765,9 +801,9 @@ impl DistributionService {
         key: impl Into<String>,
         acl: CannedAcl,
     ) -> Result<ObjectAclRecord, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
         let key = self.canonical_object_key(key.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), Some(&key))?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         let record = ObjectAclRecord {
             tenant_id: tenant_id.clone(),
@@ -792,9 +828,9 @@ impl DistributionService {
         bucket: impl Into<String>,
         key: impl Into<String>,
     ) -> Result<ObjectAclRecord, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
         let key = self.canonical_object_key(key.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &bucket, Some(&key))?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         Ok(self
             .read_encrypted_json::<ObjectAclRecord>(
@@ -816,8 +852,8 @@ impl DistributionService {
         auth: &AuthContext,
         mut config: LifecycleConfig,
     ) -> Result<LifecycleConfig, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &config.tenant_id)?;
         let bucket = self.canonical_bucket(config.bucket.clone())?;
+        self.ensure_bucket_mutation_scope_for(auth, &config.tenant_id, Some(&bucket), None)?;
         let _ = self.require_bucket(&config.tenant_id, &bucket)?;
         if config.rules.iter().any(|rule| {
             rule.expire_after_days.is_none()
@@ -846,8 +882,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<LifecycleConfig, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &bucket, None)?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         self.read_encrypted_json::<LifecycleConfig>(
             &tenant_id,
@@ -869,8 +905,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<(), ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), None)?;
         self.delete_store_key(&tenant_id, LIFECYCLE_STORE, &lifecycle_store_key(&bucket))
     }
 
@@ -883,9 +919,9 @@ impl DistributionService {
         immutable_until_ms: Option<u64>,
         mode: Option<String>,
     ) -> Result<ObjectLockRecord, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
         let key = self.canonical_object_key(key.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), Some(&key))?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         let mut record = self
             .read_encrypted_json::<ObjectLockRecord>(
@@ -922,9 +958,9 @@ impl DistributionService {
         key: impl Into<String>,
         legal_hold: bool,
     ) -> Result<ObjectLockRecord, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
         let key = self.canonical_object_key(key.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), Some(&key))?;
         let _ = self.require_bucket(&tenant_id, &bucket)?;
         let mut record = self
             .read_encrypted_json::<ObjectLockRecord>(
@@ -959,9 +995,9 @@ impl DistributionService {
         bucket: impl Into<String>,
         key: impl Into<String>,
     ) -> Result<ObjectLockRecord, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
         let key = self.canonical_object_key(key.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &bucket, Some(&key))?;
         Ok(self
             .read_encrypted_json::<ObjectLockRecord>(
                 &tenant_id,
@@ -984,8 +1020,8 @@ impl DistributionService {
         auth: &AuthContext,
         mut config: WebsiteConfig,
     ) -> Result<WebsiteConfig, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &config.tenant_id)?;
         let bucket = self.canonical_bucket(config.bucket.clone())?;
+        self.ensure_bucket_mutation_scope_for(auth, &config.tenant_id, Some(&bucket), None)?;
         let _ = self.require_bucket(&config.tenant_id, &bucket)?;
         if config.access_profile != AccessProfile::TrustedEdgeV1
             || !self.config.plaintext_profile_enabled
@@ -1013,8 +1049,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<WebsiteConfig, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &bucket, None)?;
         self.read_encrypted_json::<WebsiteConfig>(
             &tenant_id,
             WEBSITE_STORE,
@@ -1035,8 +1071,8 @@ impl DistributionService {
         tenant_id: TenantId,
         bucket: impl Into<String>,
     ) -> Result<(), ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let bucket = self.canonical_bucket(bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&bucket), None)?;
         self.delete_store_key(&tenant_id, WEBSITE_STORE, &website_store_key(&bucket))
     }
 
@@ -1045,9 +1081,20 @@ impl DistributionService {
         auth: &AuthContext,
         mut config: ReplicationConfig,
     ) -> Result<ReplicationConfig, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &config.tenant_id)?;
         let source_bucket = self.canonical_bucket(config.source_bucket.clone())?;
         let destination_bucket = self.canonical_bucket(config.destination_bucket.clone())?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &config.tenant_id,
+            Some(&source_bucket),
+            config.prefix.as_deref(),
+        )?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &config.tenant_id,
+            Some(&destination_bucket),
+            config.prefix.as_deref(),
+        )?;
         if source_bucket == destination_bucket {
             return Err(ApiError::new(
                 ApiErrorCategory::Validation,
@@ -1075,8 +1122,8 @@ impl DistributionService {
         tenant_id: TenantId,
         source_bucket: impl Into<String>,
     ) -> Result<ReplicationConfig, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let source_bucket = self.canonical_bucket(source_bucket.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &source_bucket, None)?;
         self.read_encrypted_json::<ReplicationConfig>(
             &tenant_id,
             REPLICATION_STORE,
@@ -1097,8 +1144,8 @@ impl DistributionService {
         tenant_id: TenantId,
         source_bucket: impl Into<String>,
     ) -> Result<ReplicationStatus, ApiError> {
-        self.ensure_bucket_read_scope(auth, &tenant_id)?;
         let source_bucket = self.canonical_bucket(source_bucket.into())?;
+        self.ensure_bucket_read_scope_for(auth, &tenant_id, &source_bucket, None)?;
         Ok(self
             .read_encrypted_json::<ReplicationStatus>(
                 &tenant_id,
@@ -1122,8 +1169,8 @@ impl DistributionService {
         tenant_id: TenantId,
         source_bucket: impl Into<String>,
     ) -> Result<(), ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let source_bucket = self.canonical_bucket(source_bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&source_bucket), None)?;
         self.delete_store_key(
             &tenant_id,
             REPLICATION_STORE,
@@ -1142,8 +1189,8 @@ impl DistributionService {
         tenant_id: TenantId,
         source_bucket: impl Into<String>,
     ) -> Result<ReplicationStatus, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &tenant_id)?;
         let source_bucket = self.canonical_bucket(source_bucket.into())?;
+        self.ensure_bucket_mutation_scope_for(auth, &tenant_id, Some(&source_bucket), None)?;
         let config = self.get_replication_config(auth, tenant_id.clone(), source_bucket.clone())?;
         let mut copied_objects = 0u64;
         let mut failed_objects = 0u64;
@@ -1219,10 +1266,15 @@ impl DistributionService {
         request: PutObjectRequest,
         payload: &[u8],
     ) -> Result<PutObjectResponse, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
         self.validate_access_profile(request.access_profile, request.payload_plaintext)?;
         let bucket = self.require_bucket(&request.tenant_id, &request.bucket)?;
         let key = self.canonical_object_key(request.key.clone())?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&bucket.bucket),
+            Some(&key),
+        )?;
         let mut effective_ciphertext = payload.to_vec();
         let mut server_visible_metadata = request.server_visible_metadata.clone();
         let mut wrapped_object_keys = request.wrapped_object_keys.clone();
@@ -1446,12 +1498,63 @@ impl DistributionService {
             ));
         }
         let (head, selector, immutable) = if let Some(cid) = request.cid.clone() {
-            self.ensure_bucket_read_scope(auth, &request.tenant_id)?;
+            let binding = match (request.bucket.as_deref(), request.key.as_deref()) {
+                (Some(bucket_name), Some(key)) => {
+                    let bucket = self.require_bucket(&request.tenant_id, bucket_name)?;
+                    let key = self.canonical_object_key(key.to_string())?;
+                    self.ensure_bucket_read_scope_for(
+                        auth,
+                        &request.tenant_id,
+                        &bucket.bucket,
+                        Some(&key),
+                    )?;
+                    let resolved = self
+                        .alpha
+                        .resolve(
+                            auth,
+                            ResolveRequest {
+                                tenant_id: request.tenant_id.clone(),
+                                namespace: bucket.namespace.clone(),
+                                path: key.clone(),
+                                at_revision: None,
+                                if_revision: None,
+                            },
+                        )
+                        .map_err(map_object_error)?;
+                    if resolved.target_cid.as_deref() != Some(cid.as_str())
+                        && resolved.manifest_cid.as_deref() != Some(cid.as_str())
+                    {
+                        return Err(ApiError::new(
+                            ApiErrorCategory::Policy,
+                            "cid_binding_mismatch",
+                            "requested CID is not bound to the scoped bucket/key",
+                        ));
+                    }
+                    Some((bucket, key))
+                }
+                (None, None) => {
+                    self.ensure_unscoped_cid_read_scope(auth, &request.tenant_id)?;
+                    None
+                }
+                _ => {
+                    return Err(ApiError::new(
+                        ApiErrorCategory::Validation,
+                        "missing_cid_binding",
+                        "CID reads must provide both bucket and key when a binding is supplied",
+                    ))
+                }
+            };
+            let selector = binding
+                .as_ref()
+                .map(|(bucket, key)| {
+                    ObjectSelector::namespace(bucket.namespace.clone(), key.clone())
+                })
+                .unwrap_or_else(|| ObjectSelector::cid(cid.clone()));
             let manifest_only = self.alpha.get(
                 auth,
                 GetRequest {
                     tenant_id: request.tenant_id.clone(),
-                    selector: ObjectSelector::cid(cid.clone()),
+                    selector: selector.clone(),
                     preference: Some(GetPreference::ManifestOnly),
                     range: None,
                 },
@@ -1468,8 +1571,14 @@ impl DistributionService {
                     exists: manifest_only.meta.exists,
                     deleted: manifest_only.meta.deleted,
                     cid: manifest_only.meta.cid.clone(),
-                    bucket: request.bucket.clone().unwrap_or_default(),
-                    key: request.key.clone().unwrap_or_else(|| cid.clone()),
+                    bucket: binding
+                        .as_ref()
+                        .map(|(bucket, _)| bucket.bucket.clone())
+                        .unwrap_or_default(),
+                    key: binding
+                        .as_ref()
+                        .map(|(_, key)| key.clone())
+                        .unwrap_or_else(|| cid.clone()),
                     object_cid: manifest_only.meta.object_cid.clone(),
                     manifest_cid: manifest_only.meta.manifest_cid.clone(),
                     integrity_hash: manifest_only.meta.integrity_hash.clone(),
@@ -1487,7 +1596,7 @@ impl DistributionService {
                         .encrypted_client_metadata_redacted,
                     metadata_visibility: manifest_only.meta.metadata_visibility,
                 },
-                ObjectSelector::cid(cid),
+                selector,
                 true,
             )
         } else {
@@ -1654,9 +1763,14 @@ impl DistributionService {
         auth: &AuthContext,
         request: DeleteObjectRequest,
     ) -> Result<DeleteObjectResponse, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
         let bucket = self.require_bucket(&request.tenant_id, &request.bucket)?;
         let key = self.canonical_object_key(request.key)?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&bucket.bucket),
+            Some(&key),
+        )?;
         let resolved = self
             .alpha
             .resolve(
@@ -1723,18 +1837,24 @@ impl DistributionService {
         auth: &AuthContext,
         request: ListObjectsRequest,
     ) -> Result<ListObjectsResponse, ApiError> {
-        self.ensure_bucket_read_scope_for(auth, &request.tenant_id, &request.bucket, None)?;
         let bucket = self.require_bucket(&request.tenant_id, &request.bucket)?;
+        let prefix = request
+            .prefix
+            .as_ref()
+            .map(|prefix| self.canonical_object_key(prefix.clone()))
+            .transpose()?;
+        self.ensure_bucket_read_scope_for(
+            auth,
+            &request.tenant_id,
+            &bucket.bucket,
+            prefix.as_deref(),
+        )?;
         let listed = self.alpha.list(
             auth,
             ListRequest {
                 tenant_id: request.tenant_id.clone(),
                 namespace: bucket.namespace,
-                prefix: request
-                    .prefix
-                    .as_ref()
-                    .map(|prefix| self.canonical_object_key(prefix.clone()))
-                    .transpose()?,
+                prefix,
                 cursor: request.continuation_token.clone(),
                 limit: request.limit,
                 recursive: true,
@@ -1773,20 +1893,31 @@ impl DistributionService {
         auth: &AuthContext,
         request: CopyObjectRequest,
     ) -> Result<CopyObjectResponse, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
         let source_bucket = self.require_bucket(&request.tenant_id, &request.source_bucket)?;
         let destination_bucket =
             self.require_bucket(&request.tenant_id, &request.destination_bucket)?;
         let source_key = self.canonical_object_key(request.source_key)?;
         let destination_key = self.canonical_object_key(request.destination_key)?;
+        self.ensure_bucket_read_scope_for(
+            auth,
+            &request.tenant_id,
+            &source_bucket.bucket,
+            Some(&source_key),
+        )?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&destination_bucket.bucket),
+            Some(&destination_key),
+        )?;
         let source = self
             .alpha
             .resolve(
                 auth,
                 ResolveRequest {
                     tenant_id: request.tenant_id.clone(),
-                    namespace: source_bucket.namespace,
-                    path: source_key,
+                    namespace: source_bucket.namespace.clone(),
+                    path: source_key.clone(),
                     at_revision: None,
                     if_revision: None,
                 },
@@ -1863,10 +1994,15 @@ impl DistributionService {
         auth: &AuthContext,
         request: CreateMultipartUploadRequest,
     ) -> Result<CreateMultipartUploadResponse, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
         self.validate_access_profile(request.access_profile, request.payload_plaintext)?;
         let bucket = self.require_bucket(&request.tenant_id, &request.bucket)?;
         let key = self.canonical_object_key(request.key.clone())?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&bucket.bucket),
+            Some(&key),
+        )?;
         if !request.payload_plaintext && request.wrapped_object_keys.is_empty() {
             return Err(ApiError::new(
                 ApiErrorCategory::Unsupported,
@@ -1921,8 +2057,14 @@ impl DistributionService {
         request: UploadPartRequest,
         ciphertext_part: &[u8],
     ) -> Result<UploadPartResponse, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
+        self.ensure_tenant_matches(auth, &request.tenant_id)?;
         let session = self.multipart_session(&request.tenant_id, &request.upload_id)?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&session.bucket),
+            Some(&session.key),
+        )?;
         if session.completed {
             return Err(ApiError::new(
                 ApiErrorCategory::Conflict,
@@ -1963,8 +2105,14 @@ impl DistributionService {
         auth: &AuthContext,
         request: CompleteMultipartUploadRequest,
     ) -> Result<PutObjectResponse, ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
+        self.ensure_tenant_matches(auth, &request.tenant_id)?;
         let mut session = self.multipart_session(&request.tenant_id, &request.upload_id)?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&session.bucket),
+            Some(&session.key),
+        )?;
         if session.completed {
             return Err(ApiError::new(
                 ApiErrorCategory::Conflict,
@@ -2061,7 +2209,14 @@ impl DistributionService {
         auth: &AuthContext,
         request: AbortMultipartUploadRequest,
     ) -> Result<(), ApiError> {
-        self.ensure_bucket_mutation_scope(auth, &request.tenant_id)?;
+        self.ensure_tenant_matches(auth, &request.tenant_id)?;
+        let session = self.multipart_session(&request.tenant_id, &request.upload_id)?;
+        self.ensure_bucket_mutation_scope_for(
+            auth,
+            &request.tenant_id,
+            Some(&session.bucket),
+            Some(&session.key),
+        )?;
         let parts = self.multipart_parts(&request.tenant_id, &request.upload_id)?;
         let numbers = parts
             .into_iter()
@@ -2133,8 +2288,13 @@ impl DistributionService {
         Ok(format!("{payload_b64}.{signature}"))
     }
 
-    pub fn authenticate_edge_token(&self, token: &str) -> Result<AuthContext, ApiError> {
+    pub fn authenticate_edge_token(
+        &self,
+        token: &str,
+        request_method: &str,
+    ) -> Result<AuthContext, ApiError> {
         let claims = self.decode_edge_token(token)?;
+        ensure_edge_token_method(&claims, request_method)?;
         Ok(AuthContext {
             claims: CapabilityClaims {
                 iss: "hsp-cdn".to_string(),
@@ -2646,10 +2806,27 @@ impl DistributionService {
         Ok(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
     }
 
-    fn ensure_bucket_mutation_scope(
+    fn ensure_tenant_matches(
         &self,
         auth: &AuthContext,
         tenant_id: &TenantId,
+    ) -> Result<(), ApiError> {
+        if auth.claims.tenant_id != *tenant_id {
+            return Err(ApiError::new(
+                ApiErrorCategory::Auth,
+                "tenant_mismatch",
+                "tenant does not match the authenticated principal",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ensure_bucket_mutation_scope_for(
+        &self,
+        auth: &AuthContext,
+        tenant_id: &TenantId,
+        bucket: Option<&str>,
+        key: Option<&str>,
     ) -> Result<(), ApiError> {
         if auth.claims.tenant_id != *tenant_id {
             return Err(ApiError::new(
@@ -2670,6 +2847,7 @@ impl DistributionService {
                 "bucket mutation requires write-capable credentials",
             ));
         }
+        ensure_bucket_scope_matches(auth, bucket, key)?;
         Ok(())
     }
 
@@ -2677,6 +2855,16 @@ impl DistributionService {
         &self,
         auth: &AuthContext,
         tenant_id: &TenantId,
+    ) -> Result<(), ApiError> {
+        self.ensure_bucket_read_scope_for_optional(auth, tenant_id, None, None)
+    }
+
+    fn ensure_bucket_read_scope_for_optional(
+        &self,
+        auth: &AuthContext,
+        tenant_id: &TenantId,
+        bucket: Option<&str>,
+        key: Option<&str>,
     ) -> Result<(), ApiError> {
         if auth.claims.tenant_id != *tenant_id {
             return Err(ApiError::new(
@@ -2697,6 +2885,36 @@ impl DistributionService {
                 "bucket read requires read-capable credentials",
             ));
         }
+        ensure_bucket_scope_matches(auth, bucket, key)?;
+        Ok(())
+    }
+
+    fn ensure_unscoped_cid_read_scope(
+        &self,
+        auth: &AuthContext,
+        tenant_id: &TenantId,
+    ) -> Result<(), ApiError> {
+        if auth.claims.tenant_id != *tenant_id {
+            return Err(ApiError::new(
+                ApiErrorCategory::Auth,
+                "tenant_mismatch",
+                "tenant does not match the authenticated principal",
+            ));
+        }
+        if !has_cid_read_capability(auth) {
+            return Err(ApiError::new(
+                ApiErrorCategory::Auth,
+                "operation_not_allowed",
+                "CID read requires tenant read-capable credentials",
+            ));
+        }
+        if auth.claims.namespace_prefix.is_some() || auth.claims.path_prefix.is_some() {
+            return Err(ApiError::new(
+                ApiErrorCategory::Policy,
+                "cid_scope_requires_binding",
+                "CID reads with scoped credentials require a proven bucket/key binding",
+            ));
+        }
         Ok(())
     }
 
@@ -2715,6 +2933,7 @@ impl DistributionService {
             ));
         }
         if has_read_capability(auth) {
+            ensure_bucket_scope_matches(auth, Some(bucket), key)?;
             return Ok(());
         }
         let bucket_acl = self.read_encrypted_json::<BucketAclRecord>(
@@ -2727,6 +2946,7 @@ impl DistributionService {
             .map(|record| acl_allows_read(record.acl))
             .unwrap_or(false)
         {
+            ensure_bucket_scope_matches(auth, Some(bucket), key)?;
             return Ok(());
         }
         if let Some(key) = key {
@@ -2740,6 +2960,7 @@ impl DistributionService {
                 .map(|record| acl_allows_read(record.acl))
                 .unwrap_or(false)
             {
+                ensure_bucket_scope_matches(auth, Some(bucket), Some(key))?;
                 return Ok(());
             }
         }
@@ -2751,38 +2972,11 @@ impl DistributionService {
     }
 
     fn canonical_bucket(&self, bucket: String) -> Result<String, ApiError> {
-        if bucket.trim().is_empty() || bucket.contains('/') {
-            return Err(ApiError::new(
-                ApiErrorCategory::Validation,
-                "invalid_bucket",
-                "bucket name must be non-empty and must not contain '/'",
-            ));
-        }
-        let canonical = canonical_path(&bucket).map_err(|error| {
-            ApiError::new(
-                ApiErrorCategory::Validation,
-                "invalid_bucket",
-                error.to_string(),
-            )
-        })?;
-        if canonical.trim().is_empty() || canonical.contains('/') {
-            return Err(ApiError::new(
-                ApiErrorCategory::Validation,
-                "invalid_bucket",
-                "bucket name must remain a single canonical segment after percent-decoding",
-            ));
-        }
-        Ok(canonical)
+        canonical_bucket_name(&bucket)
     }
 
     fn canonical_object_key(&self, key: String) -> Result<String, ApiError> {
-        canonical_path(&key).map_err(|error| {
-            ApiError::new(
-                ApiErrorCategory::Validation,
-                "invalid_object_key",
-                error.to_string(),
-            )
-        })
+        canonical_object_key_name(&key)
     }
 
     fn ensure_store_roots(&self) -> Result<(), ApiError> {
@@ -3405,6 +3599,79 @@ fn has_read_capability(auth: &AuthContext) -> bool {
     })
 }
 
+fn has_cid_read_capability(auth: &AuthContext) -> bool {
+    has_read_capability(auth)
+        || auth
+            .claims
+            .ops
+            .iter()
+            .any(|scope| matches!(scope, CapabilityScope::AdminRepair))
+}
+
+fn ensure_bucket_scope_matches(
+    auth: &AuthContext,
+    bucket: Option<&str>,
+    key: Option<&str>,
+) -> Result<(), ApiError> {
+    if let Some(namespace_prefix) = &auth.claims.namespace_prefix {
+        let bucket = bucket.ok_or_else(namespace_scope_mismatch)?;
+        if !segment_prefix_matches(namespace_prefix, bucket) {
+            return Err(namespace_scope_mismatch());
+        }
+    }
+    if let Some(path_prefix) = &auth.claims.path_prefix {
+        let key = key.ok_or_else(path_scope_mismatch)?;
+        if !segment_prefix_matches(path_prefix, key) {
+            return Err(path_scope_mismatch());
+        }
+    }
+    Ok(())
+}
+
+fn namespace_scope_mismatch() -> ApiError {
+    ApiError::new(
+        ApiErrorCategory::Policy,
+        "namespace_scope_mismatch",
+        "bucket is outside the authenticated namespace scope",
+    )
+}
+
+fn path_scope_mismatch() -> ApiError {
+    ApiError::new(
+        ApiErrorCategory::Policy,
+        "path_scope_mismatch",
+        "object key is outside the authenticated path scope",
+    )
+}
+
+fn validate_edge_signing_secret(secret: &[u8]) -> Result<(), ApiError> {
+    let forbidden_default = DEFAULT_EDGE_SIGNING_SECRET_LITERALS
+        .iter()
+        .any(|literal| secret.eq_ignore_ascii_case(literal.as_bytes()));
+    if secret.len() < MIN_RUNTIME_SECRET_BYTES || forbidden_default {
+        return Err(ApiError::new(
+            ApiErrorCategory::Policy,
+            "weak_edge_signing_secret",
+            "edge signing secret must be configured explicitly and must not use a default value",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_edge_token_method(
+    claims: &EdgeTokenClaims,
+    request_method: &str,
+) -> Result<(), ApiError> {
+    if claims.method.eq_ignore_ascii_case(request_method) {
+        return Ok(());
+    }
+    Err(ApiError::new(
+        ApiErrorCategory::Auth,
+        "invalid_edge_token_method",
+        "edge token method does not match the request method",
+    ))
+}
+
 fn acl_allows_read(acl: CannedAcl) -> bool {
     matches!(acl, CannedAcl::PublicRead | CannedAcl::AuthenticatedRead)
 }
@@ -3576,7 +3843,7 @@ mod tests {
             registry,
             signing_key,
             "dist-key",
-            b"edge-secret".to_vec(),
+            b"distribution-test-edge-secret-0001".to_vec(),
         )
         .unwrap()
     }
@@ -3643,6 +3910,45 @@ mod tests {
         }
     }
 
+    fn scoped_read_auth(namespace_prefix: Option<&str>, path_prefix: Option<&str>) -> AuthContext {
+        AuthContext {
+            claims: CapabilityClaims {
+                iss: "dist".to_string(),
+                sub: "scoped-reader".to_string(),
+                aud: "hsp-s3".to_string(),
+                exp: now_ms() + 60_000,
+                nbf: Some(now_ms() - 1_000),
+                jti: Some(format!("jti-scoped-{}", now_ms())),
+                ops: vec![CapabilityScope::Read],
+                tenant_id: TenantId("tenant-alpha".to_string()),
+                namespace_prefix: namespace_prefix.map(ToString::to_string),
+                path_prefix: path_prefix.map(ToString::to_string),
+                max_object_size: Some(32 * 1024 * 1024),
+                storage_classes: vec![DEFAULT_STORAGE_CLASS.to_string()],
+                key_policy_id: Some(KeyPolicyId("policy-default".to_string())),
+                metadata_visibility: Some(VisibilityMode::Split),
+            },
+            channel_binding: Some(ChannelBindingProof {
+                binding_kind: "request-signature".to_string(),
+                proof_b64: "scoped".to_string(),
+                nonce: "nonce".to_string(),
+            }),
+        }
+    }
+
+    fn scoped_auth(
+        namespace_prefix: Option<&str>,
+        path_prefix: Option<&str>,
+        ops: Vec<CapabilityScope>,
+    ) -> AuthContext {
+        let mut scoped = auth();
+        scoped.claims.sub = "scoped".to_string();
+        scoped.claims.ops = ops;
+        scoped.claims.namespace_prefix = namespace_prefix.map(ToString::to_string);
+        scoped.claims.path_prefix = path_prefix.map(ToString::to_string);
+        scoped
+    }
+
     fn wrapped_key() -> WrappedObjectKeyRecord {
         WrappedObjectKeyRecord {
             recipient_key_id: "reader-1".to_string(),
@@ -3651,6 +3957,39 @@ mod tests {
             key_version: 1,
             encapsulated_key_b64: Some(URL_SAFE_NO_PAD.encode(b"nonce")),
         }
+    }
+
+    fn put_test_object(
+        service: &DistributionService,
+        auth: &AuthContext,
+        bucket: &str,
+        key: &str,
+        idempotency_key: &str,
+    ) -> PutObjectResponse {
+        service
+            .put_object(
+                auth,
+                PutObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    access_profile: AccessProfile::PublicCiphertext,
+                    payload_plaintext: false,
+                    content_type: "application/octet-stream".to_string(),
+                    encryption_profile_id: EncryptionProfileId("profile-e2ee".to_string()),
+                    key_policy_id: KeyPolicyId("policy-default".to_string()),
+                    metadata_visibility: VisibilityMode::Split,
+                    content_encryption_suite: "XChaCha20-Poly1305".to_string(),
+                    key_wrapping_suite: "HPKE/X25519".to_string(),
+                    wrapped_object_keys: vec![wrapped_key()],
+                    server_visible_metadata: BTreeMap::new(),
+                    encrypted_client_metadata: BTreeMap::new(),
+                    storage_class: DEFAULT_STORAGE_CLASS.to_string(),
+                    idempotency_key: idempotency_key.to_string(),
+                },
+                b"ciphertext-object-data",
+            )
+            .unwrap()
     }
 
     fn register_sigv4_key(service: &DistributionService) {
@@ -3787,6 +4126,222 @@ mod tests {
     }
 
     #[test]
+    fn scoped_credentials_cannot_cross_bucket_or_path() {
+        let service = service();
+        let admin = auth();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "private")
+            .unwrap();
+        put_test_object(
+            &service,
+            &admin,
+            "media",
+            "allowed/object.bin",
+            "scoped-media-put",
+        );
+        put_test_object(
+            &service,
+            &admin,
+            "private",
+            "allowed/object.bin",
+            "scoped-private-put",
+        );
+
+        let scoped = scoped_read_auth(Some("media"), Some("allowed"));
+        let allowed = service
+            .head_object(
+                &scoped,
+                HeadObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    bucket: "media".to_string(),
+                    key: "allowed/object.bin".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(allowed.bucket, "media");
+
+        let path_error = service
+            .head_object(
+                &scoped,
+                HeadObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    bucket: "media".to_string(),
+                    key: "blocked/object.bin".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(path_error.code, "path_scope_mismatch");
+
+        let bucket_error = service
+            .head_object(
+                &scoped,
+                HeadObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    bucket: "private".to_string(),
+                    key: "allowed/object.bin".to_string(),
+                },
+            )
+            .unwrap_err();
+        assert_eq!(bucket_error.code, "namespace_scope_mismatch");
+    }
+
+    #[test]
+    fn bucket_metadata_honors_namespace_and_path_scope() {
+        let service = service();
+        let admin = auth();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "private")
+            .unwrap();
+
+        let bucket_reader = scoped_auth(
+            Some("media"),
+            None,
+            vec![CapabilityScope::Read, CapabilityScope::List],
+        );
+        let media_acl = service
+            .get_bucket_acl(
+                &bucket_reader,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+            )
+            .unwrap();
+        assert_eq!(media_acl.bucket, "media");
+
+        let namespace_error = service
+            .get_bucket_acl(
+                &bucket_reader,
+                TenantId("tenant-alpha".to_string()),
+                "private",
+            )
+            .unwrap_err();
+        assert_eq!(namespace_error.code, "namespace_scope_mismatch");
+
+        let path_reader = scoped_auth(Some("media"), Some("allowed"), vec![CapabilityScope::Read]);
+        let path_error = service
+            .get_bucket_acl(&path_reader, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap_err();
+        assert_eq!(path_error.code, "path_scope_mismatch");
+    }
+
+    #[test]
+    fn bucket_mutations_honor_namespace_and_path_scope() {
+        let service = service();
+        let admin = auth();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "private")
+            .unwrap();
+
+        let bucket_writer = scoped_auth(
+            Some("media"),
+            None,
+            vec![
+                CapabilityScope::Write,
+                CapabilityScope::Bind,
+                CapabilityScope::Unbind,
+            ],
+        );
+        service
+            .put_bucket_acl(
+                &bucket_writer,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                CannedAcl::Private,
+            )
+            .unwrap();
+
+        let namespace_error = service
+            .put_bucket_acl(
+                &bucket_writer,
+                TenantId("tenant-alpha".to_string()),
+                "private",
+                CannedAcl::Private,
+            )
+            .unwrap_err();
+        assert_eq!(namespace_error.code, "namespace_scope_mismatch");
+
+        let path_writer = scoped_auth(
+            Some("media"),
+            Some("allowed"),
+            vec![
+                CapabilityScope::Write,
+                CapabilityScope::Bind,
+                CapabilityScope::Unbind,
+            ],
+        );
+        let path_error = service
+            .put_bucket_acl(
+                &path_writer,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                CannedAcl::Private,
+            )
+            .unwrap_err();
+        assert_eq!(path_error.code, "path_scope_mismatch");
+    }
+
+    #[test]
+    fn scoped_credentials_cannot_read_unbound_cid_directly() {
+        let service = service();
+        let admin = auth();
+        service
+            .create_bucket(&admin, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        let put = put_test_object(
+            &service,
+            &admin,
+            "media",
+            "allowed/object.bin",
+            "scoped-cid-put",
+        );
+
+        let scoped = scoped_read_auth(Some("media"), Some("allowed"));
+        let direct_error = service
+            .get_object(
+                &scoped,
+                GetObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    bucket: None,
+                    key: None,
+                    cid: Some(put.object_cid.clone()),
+                    access_profile: AccessProfile::PublicCiphertext,
+                    prefer_plaintext: false,
+                    range: None,
+                    if_match: None,
+                    if_none_match: None,
+                },
+            )
+            .unwrap_err();
+        assert_eq!(direct_error.code, "cid_scope_requires_binding");
+
+        let bound = service
+            .get_object(
+                &scoped,
+                GetObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    bucket: Some("media".to_string()),
+                    key: Some("allowed/object.bin".to_string()),
+                    cid: Some(put.object_cid),
+                    access_profile: AccessProfile::PublicCiphertext,
+                    prefer_plaintext: false,
+                    range: None,
+                    if_match: None,
+                    if_none_match: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(bound.body, b"ciphertext-object-data");
+    }
+
+    #[test]
     fn multipart_upload_roundtrip() {
         let service = service();
         let auth = auth();
@@ -3895,9 +4450,27 @@ mod tests {
                 exp: now_ms() + 60_000,
             })
             .unwrap();
-        let auth = service.authenticate_edge_token(&token).unwrap();
+        let auth = service.authenticate_edge_token(&token, "GET").unwrap();
         assert_eq!(auth.claims.tenant_id.0, "tenant-alpha");
         assert_eq!(auth.claims.ops, vec![CapabilityScope::Read]);
+    }
+
+    #[test]
+    fn edge_token_rejects_wrong_method() {
+        let service = service();
+        let token = service
+            .mint_edge_token(&EdgeTokenClaims {
+                tenant_id: TenantId("tenant-alpha".to_string()),
+                bucket: Some("media".to_string()),
+                key: Some("object.bin".to_string()),
+                cid: None,
+                access_profile: AccessProfile::PublicCiphertext,
+                method: "GET".to_string(),
+                exp: now_ms() + 60_000,
+            })
+            .unwrap();
+        let error = service.authenticate_edge_token(&token, "HEAD").unwrap_err();
+        assert_eq!(error.code, "invalid_edge_token_method");
     }
 
     #[test]

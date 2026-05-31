@@ -44,6 +44,7 @@ const SIGV4_ACCESS_KEY_ID: &str = "AKIAHSPCONFORMANCE";
 const SIGV4_SECRET_ACCESS_KEY: &str = "conformance-secret-access-key";
 const SIGV4_REGION: &str = "auto";
 const SIGV4_SERVICE: &str = "s3";
+const CONFORMANCE_KMS_SEED: &[u8] = b"conformance-shared-kms-seed-0001";
 
 struct GatewayClient {
     endpoint: Endpoint,
@@ -77,6 +78,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         root_dir: root.clone(),
         issuer_registry_path: registry_path.clone(),
         server_instance_id: "conformance-native".to_string(),
+        kms_seed: CONFORMANCE_KMS_SEED.to_vec(),
     })
     .await?;
     let gateway = spawn_gateway_beta_server(GatewayBetaConfig {
@@ -87,6 +89,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         issuer_registry_path: registry_path.clone(),
         server_instance_id: "conformance-gateway".to_string(),
         native_port: native.local_addr.port(),
+        kms_seed: CONFORMANCE_KMS_SEED.to_vec(),
     })
     .await?;
     let s3_addr = reserve_loopback_addr()?;
@@ -103,8 +106,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         issuer_registry_path: registry_path.clone(),
         namespace_signing_seed: [5u8; 32],
         namespace_signing_key_id: "test-key".to_string(),
-        edge_signing_secret: b"conformance-edge-secret".to_vec(),
-        kms_seed: b"conformance-shared-kms-seed".to_vec(),
+        edge_signing_secret: b"conformance-edge-secret-0000000001".to_vec(),
+        kms_seed: CONFORMANCE_KMS_SEED.to_vec(),
         aws_kms: None,
         virtual_host_suffix: None,
         sigv4_access_keys: vec![sigv4_access_key_record()],
@@ -121,8 +124,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         issuer_registry_path: registry_path.clone(),
         namespace_signing_seed: [5u8; 32],
         namespace_signing_key_id: "test-key".to_string(),
-        edge_signing_secret: b"conformance-edge-secret".to_vec(),
-        kms_seed: b"conformance-shared-kms-seed".to_vec(),
+        edge_signing_secret: b"conformance-edge-secret-0000000001".to_vec(),
+        kms_seed: CONFORMANCE_KMS_SEED.to_vec(),
         aws_kms: None,
     }));
     tokio::time::sleep(Duration::from_millis(250)).await;

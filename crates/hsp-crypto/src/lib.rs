@@ -99,10 +99,14 @@ enum AwsKmsRuntimeMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CryptoError {
     InvalidSeed,
+    MissingRuntimeSecret(&'static str),
+    WeakRuntimeSecret(&'static str),
     EncryptionFailed,
     DecryptionFailed,
     InvalidEnvelope,
     InvalidWrappedKey,
+    MissingAwsKmsRuntime,
+    InvalidAwsKmsRuntime,
     MissingWorkloadIdentity,
     MissingAwsCli,
     AwsCliFailed(String),
@@ -112,10 +116,22 @@ impl Display for CryptoError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidSeed => f.write_str("invalid local KMS seed"),
+            Self::MissingRuntimeSecret(name) => {
+                write!(f, "{name} must be configured explicitly")
+            }
+            Self::WeakRuntimeSecret(name) => {
+                write!(f, "{name} is empty, too short, or uses a forbidden default")
+            }
             Self::EncryptionFailed => f.write_str("encryption failed"),
             Self::DecryptionFailed => f.write_str("decryption failed"),
             Self::InvalidEnvelope => f.write_str("invalid encrypted envelope"),
             Self::InvalidWrappedKey => f.write_str("invalid wrapped key record"),
+            Self::MissingAwsKmsRuntime => {
+                f.write_str("HSP_AWS_KMS_RUNTIME must be configured explicitly")
+            }
+            Self::InvalidAwsKmsRuntime => {
+                f.write_str("HSP_AWS_KMS_RUNTIME must be either live-cli or local-dev")
+            }
             Self::MissingWorkloadIdentity => {
                 f.write_str("missing workload identity for AWS KMS provider")
             }
@@ -126,6 +142,63 @@ impl Display for CryptoError {
 }
 
 impl std::error::Error for CryptoError {}
+
+pub const MIN_RUNTIME_SECRET_BYTES: usize = 32;
+pub const DEFAULT_KMS_SEED_LITERALS: &[&str] = &[
+    "hsp-secure-alpha-local-seed",
+    "hsp-alpha-test-seed",
+    "hsp-s3-runtime-seed",
+    "hsp-cdn-runtime-seed",
+    "hsp-aws-kms-fallback-seed",
+];
+pub const DEFAULT_EDGE_SIGNING_SECRET_LITERALS: &[&str] = &["edge-secret"];
+
+pub fn validate_runtime_secret(
+    secret_name: &'static str,
+    value: &str,
+    rejected_literals: &[&str],
+) -> Result<Vec<u8>, CryptoError> {
+    validate_runtime_secret_bytes(secret_name, value.as_bytes(), rejected_literals)
+}
+
+pub fn validate_runtime_secret_bytes(
+    secret_name: &'static str,
+    value: &[u8],
+    rejected_literals: &[&str],
+) -> Result<Vec<u8>, CryptoError> {
+    let decoded = std::str::from_utf8(value).ok();
+    let material = decoded.map(str::trim).unwrap_or_default();
+    let secret_len = decoded
+        .map(|value| value.trim().len())
+        .unwrap_or(value.len());
+    if secret_len < MIN_RUNTIME_SECRET_BYTES
+        || rejected_literals
+            .iter()
+            .any(|literal| material.eq_ignore_ascii_case(literal))
+    {
+        return Err(CryptoError::WeakRuntimeSecret(secret_name));
+    }
+    Ok(decoded
+        .map(|value| value.trim().as_bytes().to_vec())
+        .unwrap_or_else(|| value.to_vec()))
+}
+
+pub fn required_runtime_secret_from_env(
+    secret_name: &'static str,
+    rejected_literals: &[&str],
+) -> Result<Vec<u8>, CryptoError> {
+    let value =
+        std::env::var(secret_name).map_err(|_| CryptoError::MissingRuntimeSecret(secret_name))?;
+    validate_runtime_secret(secret_name, &value, rejected_literals)
+}
+
+pub fn local_dev_kms_from_env(
+    secret_name: &'static str,
+    rejected_literals: &[&str],
+) -> Result<LocalDevKms, CryptoError> {
+    let seed = required_runtime_secret_from_env(secret_name, rejected_literals)?;
+    LocalDevKms::from_seed(&seed)
+}
 
 pub fn public_multitenant_crypto_profile() -> CryptoProfile {
     CryptoProfile {
@@ -487,19 +560,28 @@ impl KmsProvider for LocalDevKms {
 
 impl AwsKmsProvider {
     pub fn new(config: AwsKmsProviderConfig, local_seed: &[u8]) -> Result<Self, CryptoError> {
-        if config.workload_identity_required
+        Self::with_local_fallback(config, LocalDevKms::from_seed(local_seed)?)
+    }
+
+    pub fn with_local_fallback(
+        config: AwsKmsProviderConfig,
+        fallback: LocalDevKms,
+    ) -> Result<Self, CryptoError> {
+        let runtime_mode = match std::env::var("HSP_AWS_KMS_RUNTIME")
+            .map_err(|_| CryptoError::MissingAwsKmsRuntime)?
+            .as_str()
+        {
+            "live-cli" => AwsKmsRuntimeMode::LiveCli,
+            "local-dev" => AwsKmsRuntimeMode::LocalFallback,
+            _ => return Err(CryptoError::InvalidAwsKmsRuntime),
+        };
+        if runtime_mode == AwsKmsRuntimeMode::LiveCli
+            && config.workload_identity_required
             && std::env::var("AWS_WEB_IDENTITY_TOKEN_FILE").is_err()
             && std::env::var("AWS_ROLE_ARN").is_err()
         {
             return Err(CryptoError::MissingWorkloadIdentity);
         }
-        let runtime_mode = match std::env::var("HSP_AWS_KMS_RUNTIME")
-            .unwrap_or_else(|_| "fallback".to_string())
-            .as_str()
-        {
-            "live-cli" => AwsKmsRuntimeMode::LiveCli,
-            _ => AwsKmsRuntimeMode::LocalFallback,
-        };
         let cli_path = std::env::var("HSP_AWS_CLI_PATH").unwrap_or_else(|_| "aws".to_string());
         if runtime_mode == AwsKmsRuntimeMode::LiveCli
             && Command::new(&cli_path).arg("--version").output().is_err()
@@ -508,7 +590,7 @@ impl AwsKmsProvider {
         }
         Ok(Self {
             config,
-            fallback: LocalDevKms::from_seed(local_seed)?,
+            fallback,
             runtime_mode,
             cli_path,
         })
@@ -764,6 +846,10 @@ pub fn crypto_error_to_api(error: CryptoError, message: impl Into<String>) -> Ap
             ApiErrorCategory::Validation
         }
         CryptoError::InvalidSeed
+        | CryptoError::MissingRuntimeSecret(_)
+        | CryptoError::WeakRuntimeSecret(_)
+        | CryptoError::MissingAwsKmsRuntime
+        | CryptoError::InvalidAwsKmsRuntime
         | CryptoError::MissingWorkloadIdentity
         | CryptoError::MissingAwsCli => ApiErrorCategory::Policy,
         CryptoError::EncryptionFailed
@@ -826,9 +912,52 @@ fn decode_base64_any(input: &str, error: CryptoError) -> Result<Vec<u8>, CryptoE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::sync::{Mutex, MutexGuard};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<OsString>,
+        _lock: MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: Option<&str>) -> Self {
+            let lock = ENV_LOCK.lock().expect("env lock poisoned");
+            let previous = std::env::var_os(name);
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+            Self {
+                name,
+                previous,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     fn kms() -> LocalDevKms {
         LocalDevKms::from_seed(b"hsp-alpha-test-seed").unwrap()
+    }
+
+    fn aws_config(workload_identity_required: bool) -> AwsKmsProviderConfig {
+        AwsKmsProviderConfig {
+            key_alias: "alias/hsp-test".to_string(),
+            region: "us-east-1".to_string(),
+            workload_identity_required,
+        }
     }
 
     #[test]
@@ -845,6 +974,68 @@ mod tests {
         );
         assert_eq!(profile.key_wrapping, KeyWrappingSuite::HpkeX25519);
         assert_eq!(profile.hash, HashSuite::Sha256);
+    }
+
+    #[test]
+    fn runtime_secret_validation_rejects_missing_or_default_material() {
+        assert_eq!(
+            validate_runtime_secret(
+                "HSP_KMS_SEED",
+                "hsp-secure-alpha-local-seed",
+                DEFAULT_KMS_SEED_LITERALS
+            )
+            .unwrap_err(),
+            CryptoError::WeakRuntimeSecret("HSP_KMS_SEED")
+        );
+        assert_eq!(
+            validate_runtime_secret(
+                "HSP_EDGE_SIGNING_SECRET",
+                "edge-secret",
+                DEFAULT_EDGE_SIGNING_SECRET_LITERALS
+            )
+            .unwrap_err(),
+            CryptoError::WeakRuntimeSecret("HSP_EDGE_SIGNING_SECRET")
+        );
+        assert_eq!(
+            validate_runtime_secret("HSP_KMS_SEED", "short", DEFAULT_KMS_SEED_LITERALS)
+                .unwrap_err(),
+            CryptoError::WeakRuntimeSecret("HSP_KMS_SEED")
+        );
+    }
+
+    #[test]
+    fn runtime_secret_validation_accepts_explicit_material() {
+        let secret = validate_runtime_secret(
+            "HSP_KMS_SEED",
+            "explicit-local-dev-kms-seed-00000001",
+            DEFAULT_KMS_SEED_LITERALS,
+        )
+        .unwrap();
+        assert_eq!(secret, b"explicit-local-dev-kms-seed-00000001");
+    }
+
+    #[test]
+    fn aws_kms_requires_explicit_runtime_mode() {
+        let _env = EnvGuard::set("HSP_AWS_KMS_RUNTIME", None);
+        let error = AwsKmsProvider::new(aws_config(false), b"explicit-aws-fallback-seed-00000001")
+            .unwrap_err();
+        assert_eq!(error, CryptoError::MissingAwsKmsRuntime);
+    }
+
+    #[test]
+    fn aws_kms_rejects_legacy_fallback_runtime_alias() {
+        let _env = EnvGuard::set("HSP_AWS_KMS_RUNTIME", Some("fallback"));
+        let error = AwsKmsProvider::new(aws_config(false), b"explicit-aws-fallback-seed-00000001")
+            .unwrap_err();
+        assert_eq!(error, CryptoError::InvalidAwsKmsRuntime);
+    }
+
+    #[test]
+    fn aws_kms_allows_explicit_local_dev_runtime() {
+        let _env = EnvGuard::set("HSP_AWS_KMS_RUNTIME", Some("local-dev"));
+        let provider =
+            AwsKmsProvider::new(aws_config(false), b"explicit-aws-fallback-seed-00000001").unwrap();
+        assert_eq!(provider.runtime_mode, AwsKmsRuntimeMode::LocalFallback);
     }
 
     #[test]

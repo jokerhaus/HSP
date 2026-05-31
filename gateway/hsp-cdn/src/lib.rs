@@ -18,7 +18,8 @@ use hsp_core::{
 };
 use hsp_crypto::{AwsKmsProviderConfig, LocalDevKms};
 use hsp_distribution::{
-    AccessProfile, DistributionConfig, DistributionService, GetObjectRequest, HttpRequestBinding,
+    canonical_bucket_name, canonical_object_key_name, AccessProfile, DistributionConfig,
+    DistributionService, GetObjectRequest, HttpRequestBinding,
 };
 use hsp_service::AlphaConfig;
 use serde::{Deserialize, Serialize};
@@ -193,7 +194,7 @@ fn authenticate_request(
         .and_then(|value| value.to_str().ok())
         .or_else(|| query_params.get("token").map(String::as_str))
     {
-        service.authenticate_edge_token(token)
+        service.authenticate_edge_token(token, method.as_str())
     } else if headers.contains_key("x-hsp-capability") {
         service.authenticate_hsp_capability(&HttpRequestBinding {
             method: method.as_str(),
@@ -258,6 +259,13 @@ async fn dispatch_request(
                 ));
             }
         }
+        let cid_binding =
+            edge_claims
+                .as_ref()
+                .and_then(|claims| match (&claims.bucket, &claims.key) {
+                    (Some(bucket), Some(key)) => Some((bucket.clone(), key.clone())),
+                    _ => None,
+                });
         let prefer_plaintext = edge_claims
             .as_ref()
             .map(|claims| claims.access_profile == AccessProfile::TrustedEdgeV1)
@@ -278,8 +286,8 @@ async fn dispatch_request(
                     auth,
                     GetObjectRequest {
                         tenant_id: auth.claims.tenant_id.clone(),
-                        bucket: None,
-                        key: None,
+                        bucket: cid_binding.as_ref().map(|(bucket, _)| bucket.clone()),
+                        key: cid_binding.as_ref().map(|(_, key)| key.clone()),
                         cid: Some(cid.to_string()),
                         access_profile: edge_claims
                             .as_ref()
@@ -297,15 +305,29 @@ async fn dispatch_request(
     }
 
     if let Some(raw) = path.strip_prefix("/b/") {
-        let (bucket, key) = raw.split_once('/').ok_or_else(|| {
+        let (raw_bucket, raw_key) = raw.split_once('/').ok_or_else(|| {
             ApiError::new(
                 ApiErrorCategory::Validation,
                 "invalid_bucket_path",
                 "bucket route must use /b/{bucket}/{key}",
             )
         })?;
+        let bucket = canonical_bucket_name(raw_bucket)?;
+        let key = canonical_object_key_name(raw_key)?;
         if let Some(claims) = &edge_claims {
-            if claims.bucket.as_deref() != Some(bucket) || claims.key.as_deref() != Some(key) {
+            let claims_bucket = claims
+                .bucket
+                .as_deref()
+                .map(canonical_bucket_name)
+                .transpose()?;
+            let claims_key = claims
+                .key
+                .as_deref()
+                .map(canonical_object_key_name)
+                .transpose()?;
+            if claims_bucket.as_deref() != Some(bucket.as_str())
+                || claims_key.as_deref() != Some(key.as_str())
+            {
                 return Err(ApiError::new(
                     ApiErrorCategory::Auth,
                     "invalid_edge_token_scope",
@@ -325,7 +347,7 @@ async fn dispatch_request(
         return serve_cached_object(
             state,
             method,
-            namespace_cache_key(&auth.claims.tenant_id, bucket, key, prefer_plaintext),
+            namespace_cache_key(&auth.claims.tenant_id, &bucket, &key, prefer_plaintext),
             false,
             range.is_none(),
             || async {
@@ -333,8 +355,8 @@ async fn dispatch_request(
                     auth,
                     GetObjectRequest {
                         tenant_id: auth.claims.tenant_id.clone(),
-                        bucket: Some(bucket.to_string()),
-                        key: Some(key.to_string()),
+                        bucket: Some(bucket.clone()),
+                        key: Some(key.clone()),
                         cid: None,
                         access_profile: edge_claims
                             .as_ref()
@@ -809,11 +831,61 @@ mod tests {
     }
 
     #[test]
+    fn route_cache_keys_use_canonical_bucket_and_key() {
+        let tenant = TenantId("tenant-alpha".to_string());
+        let raw_bucket = canonical_bucket_name("media").unwrap();
+        let raw_key = canonical_object_key_name("folder%2Fobject.bin").unwrap();
+
+        assert_eq!(
+            namespace_cache_key(&tenant, &raw_bucket, &raw_key, false),
+            namespace_cache_key(&tenant, "media", "folder/object.bin", false)
+        );
+    }
+
+    #[test]
     fn cid_cache_keys_are_tenant_scoped() {
         assert_ne!(
             cid_cache_key(&TenantId("tenant-alpha".to_string()), "cid-1", false),
             cid_cache_key(&TenantId("tenant-beta".to_string()), "cid-1", false)
         );
+    }
+
+    #[test]
+    fn edge_token_auth_enforces_request_method() {
+        let service = build_test_service();
+        let token = service
+            .mint_edge_token(&hsp_distribution::EdgeTokenClaims {
+                tenant_id: TenantId("tenant-alpha".to_string()),
+                bucket: Some("media".to_string()),
+                key: Some("object.bin".to_string()),
+                cid: None,
+                access_profile: AccessProfile::PublicCiphertext,
+                method: "GET".to_string(),
+                exp: now_ms() + 60_000,
+            })
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-hsp-edge-token", token.parse().unwrap());
+
+        authenticate_request(
+            &service,
+            &Method::GET,
+            "/b/media/object.bin",
+            "",
+            &headers,
+            b"",
+        )
+        .unwrap();
+        let error = authenticate_request(
+            &service,
+            &Method::HEAD,
+            "/b/media/object.bin",
+            "",
+            &headers,
+            b"",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_edge_token_method");
     }
 
     #[test]
@@ -882,7 +954,7 @@ mod tests {
             issuer_registry_path: registry_path,
             namespace_signing_seed: [33u8; 32],
             namespace_signing_key_id: "dist-key".to_string(),
-            edge_signing_secret: b"edge-secret".to_vec(),
+            edge_signing_secret: b"cdn-test-edge-secret-000000000001".to_vec(),
             kms_seed: b"hsp-cdn-runtime-seed".to_vec(),
             aws_kms: None,
         })

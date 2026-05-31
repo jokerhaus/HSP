@@ -4,7 +4,7 @@
 
 - Date: `2026-04-23`
 - Rust toolchain: `stable` with `rustfmt` and `clippy`
-- Go toolchain: `go1.25.9`
+- Go toolchain: `go1.25.10`
 - Conformance report source: `cargo run -p hsp-conformance`
 
 ## Mandatory Gates
@@ -12,9 +12,9 @@
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit`
-- `GOTOOLCHAIN=go1.25.9+auto go work sync`
-- `cd sdk/go && GOTOOLCHAIN=go1.25.9+auto go test ./...`
-- `cd cli/hspctl && GOTOOLCHAIN=go1.25.9+auto go test ./...`
+- `GOTOOLCHAIN=go1.25.10+auto go work sync`
+- `cd sdk/go && GOTOOLCHAIN=go1.25.10+auto go test ./...`
+- `cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto go test ./...`
 - `cd sdk/go && $(go env GOPATH)/bin/govulncheck ./...`
 - `cd cli/hspctl && $(go env GOPATH)/bin/govulncheck ./...`
 - `cargo run -p hsp-conformance`

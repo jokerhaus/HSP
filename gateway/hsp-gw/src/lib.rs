@@ -38,6 +38,7 @@ pub struct GatewayBetaConfig {
     pub issuer_registry_path: PathBuf,
     pub server_instance_id: String,
     pub native_port: u16,
+    pub kms_seed: Vec<u8>,
 }
 
 pub struct GatewayBetaHandle {
@@ -50,6 +51,22 @@ pub struct GatewayBetaHandle {
 struct GatewayState {
     service: Arc<AlphaService>,
     issuer_registry: Arc<IssuerRegistry>,
+}
+
+fn gateway_runtime_kms(seed: &[u8]) -> Result<hsp_crypto::LocalDevKms, ApiError> {
+    let seed = hsp_crypto::validate_runtime_secret_bytes(
+        "HSP_KMS_SEED",
+        seed,
+        hsp_crypto::DEFAULT_KMS_SEED_LITERALS,
+    )
+    .map_err(|error| {
+        hsp_crypto::crypto_error_to_api(
+            error,
+            "HSP_KMS_SEED must be configured for gateway beta runtime KMS",
+        )
+    })?;
+    hsp_crypto::LocalDevKms::from_seed(&seed)
+        .map_err(|error| hsp_crypto::crypto_error_to_api(error, "failed to initialize gateway KMS"))
 }
 
 type GatewayBodyResponse = Result<(Response<()>, Option<Vec<Bytes>>), Box<dyn Error + Send + Sync>>;
@@ -83,11 +100,7 @@ pub async fn spawn_gateway_beta_server(
                 native_port: config.native_port,
                 server_instance_id: config.server_instance_id.clone(),
             },
-            hsp_crypto::LocalDevKms::from_seed(b"hsp-secure-alpha-local-seed").map_err(
-                |error| {
-                    hsp_crypto::crypto_error_to_api(error, "failed to initialize local dev KMS")
-                },
-            )?,
+            gateway_runtime_kms(&config.kms_seed)?,
         )?
         .with_issuer_registry((*issuer_registry).clone()),
     );
@@ -1060,6 +1073,13 @@ mod tests {
         root
     }
 
+    #[test]
+    fn gateway_runtime_kms_rejects_legacy_default_seed() {
+        let error = gateway_runtime_kms(b"hsp-secure-alpha-local-seed").unwrap_err();
+        assert_eq!(error.category, hsp_core::ApiErrorCategory::Policy);
+        assert_eq!(error.code, "crypto_error");
+    }
+
     fn write_registry(root: &Path) -> (PathBuf, SigningKey) {
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let registry_path = root.join("issuer-registry.json");
@@ -1268,6 +1288,7 @@ mod tests {
             issuer_registry_path: registry_path,
             server_instance_id: "gateway-info".to_string(),
             native_port: 9443,
+            kms_seed: b"gateway-info-test-kms-seed-0000001".to_vec(),
         })
         .await
         .unwrap();
@@ -1329,6 +1350,7 @@ mod tests {
             issuer_registry_path: registry_path,
             server_instance_id: "gateway-roundtrip".to_string(),
             native_port: 9443,
+            kms_seed: b"gateway-roundtrip-test-kms-seed-1".to_vec(),
         })
         .await
         .unwrap();
@@ -1572,6 +1594,7 @@ mod tests {
             issuer_registry_path: registry_path,
             server_instance_id: "gateway-missing-auth".to_string(),
             native_port: 9443,
+            kms_seed: b"gateway-missing-auth-test-kms-01".to_vec(),
         })
         .await
         .unwrap();
@@ -1613,6 +1636,7 @@ mod tests {
             issuer_registry_path: registry_path,
             server_instance_id: "gateway-invalid-token".to_string(),
             native_port: 9443,
+            kms_seed: b"gateway-invalid-token-test-kms-1".to_vec(),
         })
         .await
         .unwrap();
@@ -1661,6 +1685,7 @@ mod tests {
             issuer_registry_path: registry_path,
             server_instance_id: "gateway-namespace".to_string(),
             native_port: 9443,
+            kms_seed: b"gateway-namespace-test-kms-seed1".to_vec(),
         })
         .await
         .unwrap();

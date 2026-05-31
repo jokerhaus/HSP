@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -7,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hsp_auth::{
     denial_to_api_error, verify_signed_namespace_record, AuthContext, AuthRequestMeta,
-    IssuerRegistry, PolicyEngine, ReplayStatus,
+    AuthorizationDecision, DenialReason, IssuerRegistry, PolicyEngine, ReplayStatus,
 };
 use hsp_core::{
     cid_from_bytes, public_multitenant_bootstrap_document, public_multitenant_info_response,
@@ -21,7 +22,10 @@ use hsp_core::{
     SubscribeEnvelopeKind, SubscribeFilter, SubscribeRequest, TenantId, UnbindRequest,
     UnbindResponse,
 };
-use hsp_crypto::{crypto_error_to_api, LocalDevKms, StoredEnvelope};
+use hsp_crypto::{
+    crypto_error_to_api, required_runtime_secret_from_env, LocalDevKms, StoredEnvelope,
+    DEFAULT_KMS_SEED_LITERALS,
+};
 use hsp_path::canonical_path;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -137,6 +141,16 @@ struct IdempotencyRecord<T> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReplayRecord {
+    tenant_id: TenantId,
+    jti: String,
+    operation: String,
+    subject: String,
+    idempotency_key: String,
+    observed_at_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct AuditRecord {
     seq: u64,
     tenant_id: TenantId,
@@ -242,6 +256,7 @@ impl AlphaService {
                 "sessions".to_string(),
                 "audit".to_string(),
                 "idempotency".to_string(),
+                "replay".to_string(),
                 "events".to_string(),
             ],
         }
@@ -1314,40 +1329,96 @@ impl AlphaService {
         &self,
         auth: &AuthContext,
         meta: &AuthRequestMeta<'_>,
-    ) -> Result<hsp_auth::AuthorizationDecision, ApiError> {
-        self.policy_engine.authorize(auth, meta).map_err(|reason| {
-            let error = denial_to_api_error(reason.clone());
-            self.record_observation(Observation {
-                operation: "auth_denied",
-                tenant_id: meta.tenant_id,
-                namespace: meta.namespace,
-                status_code: 403,
-                outcome: "auth_denied",
-                latency_ms: 0,
-                object_size_bytes: meta.content_size,
-                error_code: Some(&error.code),
-            });
-            let _ = self.append_event(
-                meta.tenant_id,
-                EventRecord {
-                    version: 1,
-                    seq: 0,
-                    at_ms: now_ms(),
-                    event_type: EventType::AuthDenied,
-                    subject_kind: "auth".to_string(),
-                    namespace: meta.namespace.map(ToString::to_string),
-                    path: meta.path.map(ToString::to_string),
-                    cid: None,
-                    revision: None,
-                    trace_id: None,
-                    payload: BTreeMap::from([
-                        ("code".to_string(), error.code.clone()),
-                        ("operation".to_string(), meta.operation.as_str().to_string()),
-                    ]),
-                },
-            );
-            error
-        })
+    ) -> Result<AuthorizationDecision, ApiError> {
+        let decision = self
+            .policy_engine
+            .authorize(auth, meta)
+            .map_err(|reason| self.authorization_denied_api_error(meta, reason))?;
+        self.observe_durable_replay(auth, meta, decision)
+    }
+
+    fn observe_durable_replay(
+        &self,
+        auth: &AuthContext,
+        meta: &AuthRequestMeta<'_>,
+        mut decision: AuthorizationDecision,
+    ) -> Result<AuthorizationDecision, ApiError> {
+        if !meta.operation.is_mutation() {
+            return Ok(decision);
+        }
+
+        let Some(jti) = auth.claims.jti.as_deref() else {
+            return Ok(decision);
+        };
+
+        let replay_key = self.replay_key(meta.tenant_id, jti, meta.operation, meta.subject);
+        let replay_record = ReplayRecord {
+            tenant_id: meta.tenant_id.clone(),
+            jti: jti.to_string(),
+            operation: meta.operation.as_str().to_string(),
+            subject: meta.subject.to_string(),
+            idempotency_key: meta.idempotency_key.unwrap_or_default().to_string(),
+            observed_at_ms: now_ms(),
+        };
+
+        if self.create_encrypted_json(meta.tenant_id, "replay", &replay_key, &replay_record)? {
+            return Ok(decision);
+        }
+
+        let existing = self
+            .read_encrypted_json::<ReplayRecord>(meta.tenant_id, "replay", &replay_key)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCategory::Storage,
+                    "replay_record_missing",
+                    "replay record disappeared after create conflict",
+                )
+            })?;
+
+        if meta.idempotency_key == Some(existing.idempotency_key.as_str()) {
+            decision.replay_status = ReplayStatus::IdempotentRetry;
+            return Ok(decision);
+        }
+
+        Err(self.authorization_denied_api_error(meta, DenialReason::ReplayDetected))
+    }
+
+    fn authorization_denied_api_error(
+        &self,
+        meta: &AuthRequestMeta<'_>,
+        reason: DenialReason,
+    ) -> ApiError {
+        let error = denial_to_api_error(reason);
+        self.record_observation(Observation {
+            operation: "auth_denied",
+            tenant_id: meta.tenant_id,
+            namespace: meta.namespace,
+            status_code: 403,
+            outcome: "auth_denied",
+            latency_ms: 0,
+            object_size_bytes: meta.content_size,
+            error_code: Some(&error.code),
+        });
+        let _ = self.append_event(
+            meta.tenant_id,
+            EventRecord {
+                version: 1,
+                seq: 0,
+                at_ms: now_ms(),
+                event_type: EventType::AuthDenied,
+                subject_kind: "auth".to_string(),
+                namespace: meta.namespace.map(ToString::to_string),
+                path: meta.path.map(ToString::to_string),
+                cid: None,
+                revision: None,
+                trace_id: None,
+                payload: BTreeMap::from([
+                    ("code".to_string(), error.code.clone()),
+                    ("operation".to_string(), meta.operation.as_str().to_string()),
+                ]),
+            },
+        );
+        error
     }
 
     fn selector_resolution(
@@ -2150,6 +2221,27 @@ impl AlphaService {
         self.write_encrypted_bytes(tenant_id, store_kind, key, &bytes)
     }
 
+    fn create_encrypted_json<T: Serialize>(
+        &self,
+        tenant_id: &TenantId,
+        store_kind: &str,
+        key: &str,
+        value: &T,
+    ) -> Result<bool, ApiError> {
+        let bytes = serde_json::to_vec_pretty(value).map_err(|error| {
+            ApiError::new(
+                ApiErrorCategory::Storage,
+                "json_serialize_failed",
+                error.to_string(),
+            )
+        })?;
+        let envelope = self
+            .kms
+            .encrypt_store_payload(tenant_id, store_kind, &bytes)
+            .map_err(|error| crypto_error_to_api(error, "failed to encrypt store payload"))?;
+        self.create_envelope(tenant_id, store_kind, key, &envelope)
+    }
+
     fn read_encrypted_json<T: DeserializeOwned>(
         &self,
         tenant_id: &TenantId,
@@ -2243,6 +2335,55 @@ impl AlphaService {
         })
     }
 
+    fn create_envelope(
+        &self,
+        tenant_id: &TenantId,
+        store_kind: &str,
+        key: &str,
+        envelope: &StoredEnvelope,
+    ) -> Result<bool, ApiError> {
+        let path = self.store_path(tenant_id, store_kind, key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|error| {
+                ApiError::new(ApiErrorCategory::Storage, "mkdir_failed", error.to_string())
+            })?;
+        }
+
+        let bytes = serde_json::to_vec_pretty(envelope).map_err(|error| {
+            ApiError::new(
+                ApiErrorCategory::Storage,
+                "envelope_serialize_failed",
+                error.to_string(),
+            )
+        })?;
+        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+            Err(error) => {
+                return Err(ApiError::new(
+                    ApiErrorCategory::Storage,
+                    "store_create_failed",
+                    error.to_string(),
+                ))
+            }
+        };
+        file.write_all(&bytes).map_err(|error| {
+            ApiError::new(
+                ApiErrorCategory::Storage,
+                "store_write_failed",
+                error.to_string(),
+            )
+        })?;
+        file.sync_all().map_err(|error| {
+            ApiError::new(
+                ApiErrorCategory::Storage,
+                "store_sync_failed",
+                error.to_string(),
+            )
+        })?;
+        Ok(true)
+    }
+
     fn ensure_store_roots(&self) -> Result<(), ApiError> {
         for store_kind in [
             "chunks",
@@ -2253,6 +2394,7 @@ impl AlphaService {
             "sessions",
             "audit",
             "idempotency",
+            "replay",
             "events",
         ] {
             fs::create_dir_all(self.config.root_dir.join(store_kind)).map_err(|error| {
@@ -2276,6 +2418,21 @@ impl AlphaService {
             "{op}-{}-{}",
             cid_from_bytes(tenant_id.0.as_bytes()),
             cid_from_bytes(value.as_bytes())
+        )
+    }
+
+    fn replay_key(
+        &self,
+        tenant_id: &TenantId,
+        jti: &str,
+        operation: OperationName,
+        subject: &str,
+    ) -> String {
+        let replay_key = format!("{tenant_id}|{jti}|{}|{subject}", operation.as_str());
+        format!(
+            "{}-{}",
+            operation.as_str().to_ascii_lowercase(),
+            cid_from_bytes(replay_key.as_bytes())
         )
     }
 
@@ -2328,8 +2485,22 @@ impl AlphaService {
 }
 
 pub fn default_alpha_service(root_dir: impl AsRef<Path>) -> Result<AlphaService, ApiError> {
-    let kms = LocalDevKms::from_seed(b"hsp-secure-alpha-local-seed")
-        .map_err(|error| crypto_error_to_api(error, "failed to initialize local dev KMS"))?;
+    let seed = required_runtime_secret_from_env("HSP_KMS_SEED", DEFAULT_KMS_SEED_LITERALS)
+        .map_err(|error| {
+            crypto_error_to_api(
+                error,
+                "HSP_KMS_SEED must be configured for alpha service KMS",
+            )
+        })?;
+    alpha_service_with_kms_seed(root_dir, &seed)
+}
+
+pub fn alpha_service_with_kms_seed(
+    root_dir: impl AsRef<Path>,
+    kms_seed: &[u8],
+) -> Result<AlphaService, ApiError> {
+    let kms = LocalDevKms::from_seed(kms_seed)
+        .map_err(|error| crypto_error_to_api(error, "failed to initialize configured KMS"))?;
     AlphaService::new(
         AlphaConfig {
             authority: "localhost".to_string(),
@@ -2386,9 +2557,10 @@ mod tests {
 
     use super::*;
     use hsp_core::{
-        CapabilityClaims, CapabilityScope, ChannelBindingProof, ChunkRef, EncryptionDescriptor,
-        EncryptionProfileId, GetPreference, GetRequest, KeyPolicyId, Manifest, ObjectSelector,
-        PutChunkRequest, PutCommitRequest, PutInitRequest, VisibilityMode, WrappedObjectKeyRecord,
+        ApiErrorCategory, CapabilityClaims, CapabilityScope, ChannelBindingProof, ChunkRef,
+        EncryptionDescriptor, EncryptionProfileId, GetPreference, GetRequest, KeyPolicyId,
+        Manifest, ObjectSelector, PutChunkRequest, PutCommitRequest, PutInitRequest,
+        VisibilityMode, WrappedObjectKeyRecord,
     };
 
     static NEXT_TEMP_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -2405,7 +2577,7 @@ mod tests {
 
     #[test]
     fn store_paths_do_not_collapse_distinct_keys() {
-        let service = default_alpha_service(temp_root()).unwrap();
+        let service = alpha_service_with_kms_seed(temp_root(), test_kms_seed()).unwrap();
         let tenant = TenantId("tenant/a".to_string());
         let slash = service.store_path(&tenant, "manifests", "folder/object");
         let underscore = service.store_path(&tenant, "manifests", "folder_object");
@@ -2413,7 +2585,11 @@ mod tests {
     }
 
     fn service() -> AlphaService {
-        default_alpha_service(temp_root()).unwrap()
+        alpha_service_with_kms_seed(temp_root(), test_kms_seed()).unwrap()
+    }
+
+    fn test_kms_seed() -> &'static [u8] {
+        b"hsp-alpha-service-test-kms-seed-01"
     }
 
     fn auth_context() -> AuthContext {
@@ -2735,6 +2911,42 @@ mod tests {
     }
 
     #[test]
+    fn persisted_replay_survives_alpha_service_restart() {
+        let root = temp_root();
+        let service = alpha_service_with_kms_seed(root.clone(), test_kms_seed()).unwrap();
+        let chunk_cid = hsp_core::cid_from_bytes(b"ciphertext!");
+        let manifest = manifest_with_chunk(chunk_cid);
+        let auth = auth_context();
+        let request = PutInitRequest {
+            tenant_id: TenantId("tenant-alpha".to_string()),
+            manifest,
+            idempotency_key: "idem-durable".to_string(),
+            encryption_profile_id: EncryptionProfileId("public-e2ee-v1".to_string()),
+            key_policy_id: KeyPolicyId("policy-default".to_string()),
+            metadata_visibility: VisibilityMode::Split,
+            storage_class: "hot".to_string(),
+            atomic_bind: None,
+        };
+
+        let first = service.put_init(&auth, request.clone()).unwrap();
+
+        let retry_service = alpha_service_with_kms_seed(root.clone(), test_kms_seed()).unwrap();
+        let retry = retry_service.put_init(&auth, request.clone()).unwrap();
+        assert_eq!(first, retry);
+
+        let replay_service = alpha_service_with_kms_seed(root, test_kms_seed()).unwrap();
+        let replay = PutInitRequest {
+            idempotency_key: "idem-different".to_string(),
+            ..request
+        };
+        let error = replay_service
+            .put_init(&auth, replay)
+            .expect_err("same mutation jti with different idempotency key must be rejected");
+        assert_eq!(error.category, ApiErrorCategory::Replay);
+        assert_eq!(error.code, "replay_detected");
+    }
+
+    #[test]
     fn readiness_reports_encrypted_store_roots() {
         let service = service();
         let readiness = service.readiness();
@@ -2748,5 +2960,8 @@ mod tests {
         assert!(readiness
             .encrypted_store_roots
             .contains(&"namespace-journal".to_string()));
+        assert!(readiness
+            .encrypted_store_roots
+            .contains(&"replay".to_string()));
     }
 }
