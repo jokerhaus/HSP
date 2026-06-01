@@ -2,7 +2,7 @@
 
 ## Release Baseline
 
-- Date: `2026-04-23`
+- Date: `2026-06-01`
 - Rust toolchain: `stable` with `rustfmt` and `clippy`
 - Go toolchain: `go1.25.10`
 - Conformance report source: `cargo run -p hsp-conformance`

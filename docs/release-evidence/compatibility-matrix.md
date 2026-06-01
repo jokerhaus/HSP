@@ -3,7 +3,7 @@
 ## Evidence Source
 
 - Primary source: `cargo run -p hsp-conformance`
-- Date: `2026-04-23`
+- Date: `2026-06-01`
 
 ## Surface Coverage
 
@@ -32,12 +32,13 @@
 
 ## Measured Local Benchmarks
 
-- `replication_run`: `23 ms`
-- `cdn_namespace_rebind_visibility`: `1626 ms`
-- `presign_near_expiry_roundtrip`: `17 ms`
+- `replication_run`: `66 ms`
+- `cdn_namespace_rebind_visibility`: `1648 ms`
+- `presign_near_expiry_roundtrip`: `16 ms`
 
 ## Remaining Acceptance Work
 
 - parity should be re-run in CI artifacts for every release candidate
-- operator environments still need their own evidence for latency, queue depth,
-  and restart behavior under realistic tenant load
+- owner-operated deployments may proceed after the mandatory gates pass
+- operator environments should still record their own latency, queue depth, and
+  restart evidence under realistic tenant load

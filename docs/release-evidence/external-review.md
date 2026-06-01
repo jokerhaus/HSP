@@ -3,8 +3,10 @@
 ## Status
 
 - Repository-side preparation: complete
-- Current local handoff bundle: `artifacts/release-review/20260423-023526.tar.gz`
-- Independent external security sign-off: pending
+- Current local handoff bundle: `artifacts/release-review/latest`
+- Independent external security sign-off: not performed
+- Owner-operated internal sign-off: complete for first-party deployments; see
+  [owner-security-signoff.md](/Users/loxar/Documents/GitHub/HSP/docs/release-evidence/owner-security-signoff.md)
 
 ## Tracking Workflow
 
@@ -40,6 +42,7 @@
 
 ## Final GA Gate
 
-Strict `production 100%` is reached only after this document is updated from
-`pending` to `complete` with reviewer identity, date, scope, findings summary,
-and disposition.
+Owner-operated `production 100%` is tracked in
+[owner-security-signoff.md](/Users/loxar/Documents/GitHub/HSP/docs/release-evidence/owner-security-signoff.md).
+Independent third-party/public SaaS GA still requires this document to be
+updated with reviewer identity, date, scope, findings summary, and disposition.

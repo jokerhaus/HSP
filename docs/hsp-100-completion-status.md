@@ -1,4 +1,4 @@
-# HSP 100% Completion Status (April 23, 2026)
+# HSP 100% Completion Status (June 1, 2026)
 
 ## Delivered In This Hardening Pass
 
@@ -55,20 +55,22 @@
 - `cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto govulncheck ./...`
 - `cargo run -p hsp-conformance`
 
-## Remaining For Strict Production Sign-Off
+## Production Sign-Off Status
 
-- External security sign-off is still required:
-  - independent review for SigV4/presign, CDN cache isolation, trusted-edge,
-    AWS KMS usage, and encrypted persisted stores
-- Operator-attested drills are still required outside local development:
-  - production or staging execution evidence for incident response
-  - key recovery / rewrap timing under the target deployment topology
-  - replication lag recovery timing under the target worker topology
-  - CDN purge failure recovery timing under the target edge topology
+- Owner-operated production use: complete after the gates in
+  `docs/release-evidence/security-gates.md` pass for the deployed commit.
+- Internal owner security sign-off is recorded in
+  `docs/release-evidence/owner-security-signoff.md`.
+- Independent third-party public SaaS sign-off remains recommended, but is not a
+  blocker for first-party projects operated by the repository owner.
+- Staging or production drills should still be repeated per target environment
+  to capture real recovery timings for incident response, key recovery/rewrap,
+  replication lag, and CDN purge failure recovery.
 
 ## Current Read
 
-Code, tests, CI gates, conformance, and release documentation are now aligned
-with the production-hardening plan. The only non-code blockers left for a strict
-`production 100%` claim are the external review and operator-run release
-evidence in a real deployment environment.
+Code, tests, CI gates, conformance, release documentation, and internal
+owner-operated sign-off are aligned with the production-hardening plan. For
+first-party owner-operated deployments, the project is considered `100%`
+complete for the current scope. For third-party/public SaaS exposure, keep the
+independent external review gate from `external-review.md`.

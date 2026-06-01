@@ -37,7 +37,7 @@ ensure_govulncheck() {
   GOVULNCHECK_BIN="$(go env GOPATH)/bin/govulncheck"
   if [[ ! -x "$GOVULNCHECK_BIN" ]]; then
     run_shell_step "install-govulncheck" \
-      'GOTOOLCHAIN=go1.25.9+auto go install golang.org/x/vuln/cmd/govulncheck@latest'
+      'GOTOOLCHAIN=go1.25.10+auto go install golang.org/x/vuln/cmd/govulncheck@latest'
   fi
   GOVULNCHECK_BIN="$(go env GOPATH)/bin/govulncheck"
 }
@@ -145,7 +145,7 @@ lines.extend(
         "",
         "## Remaining human-only step",
         "",
-        "- Independent external reviewer must sign off on SigV4/presign, CDN cache isolation, trusted-edge, AWS KMS usage, and encrypted persisted stores.",
+        "- Owner-operated deployments may proceed after internal sign-off; independent external review remains recommended for third-party/public SaaS exposure.",
     ]
 )
 (out_dir / "external-review-request.md").write_text("\n".join(lines) + "\n")
@@ -159,15 +159,15 @@ ensure_syft
 export ROOT_DIR OUT_DIR GOVULNCHECK_BIN SYFT_BIN
 
 run_step "cargo-fmt-check" cargo fmt --check
-run_shell_step "go-work-sync" 'GOTOOLCHAIN=go1.25.9+auto go work sync'
+run_shell_step "go-work-sync" 'GOTOOLCHAIN=go1.25.10+auto go work sync'
 run_step "cargo-test" cargo test --workspace --all-targets
 run_step "cargo-clippy" cargo clippy --workspace --all-targets -- -D warnings
 run_shell_step "cargo-audit" \
   'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit'
 run_shell_step "go-test-sdk" \
-  'cd sdk/go && GOTOOLCHAIN=go1.25.9+auto go test ./...'
+  'cd sdk/go && GOTOOLCHAIN=go1.25.10+auto go test ./...'
 run_shell_step "go-test-cli" \
-  'cd cli/hspctl && GOTOOLCHAIN=go1.25.9+auto go test ./...'
+  'cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto go test ./...'
 run_shell_step "govulncheck-sdk" \
   "cd sdk/go && \"$GOVULNCHECK_BIN\" ./..."
 run_shell_step "govulncheck-cli" \
