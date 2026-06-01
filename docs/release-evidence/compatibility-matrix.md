@@ -32,9 +32,10 @@
 
 ## Measured Local Benchmarks
 
-- `replication_run`: `66 ms`
-- `cdn_namespace_rebind_visibility`: `1648 ms`
-- `presign_near_expiry_roundtrip`: `16 ms`
+The latest measured local benchmark values are recorded in
+`artifacts/release-review/latest/summary.json` under
+`distribution_timings_ms`. These values are intentionally kept in the generated
+release bundle because they vary slightly between runs and hosts.
 
 ## Remaining Acceptance Work
 

@@ -59,7 +59,9 @@ The local drill bundle can be regenerated with:
   - verified destination object parity
 - Result: pass
 - Measured recovery benchmark:
-  - `replication_run`: `66 ms`
+  - latest value is recorded in
+    `artifacts/release-review/latest/summary.json` under
+    `distribution_timings_ms.replication_run`
 - Gaps:
   - no long-running worker lag simulation under sustained tenant load
 - Corrective action:
@@ -78,7 +80,9 @@ The local drill bundle can be regenerated with:
   - confirmed next CDN read was `MISS` and returned fresh ciphertext
 - Result: pass
 - Measured recovery benchmark:
-  - `cdn_namespace_rebind_visibility`: `1648 ms`
+  - latest value is recorded in
+    `artifacts/release-review/latest/summary.json` under
+    `distribution_timings_ms.cdn_namespace_rebind_visibility`
 - Gaps:
   - no multi-tenant purge-storm benchmark against deployed cache workers
 - Corrective action:
