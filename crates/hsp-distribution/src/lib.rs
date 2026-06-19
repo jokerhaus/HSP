@@ -350,6 +350,22 @@ struct ManifestBuildInput {
     encrypted_client_metadata: BTreeMap<String, String>,
 }
 
+#[derive(Debug)]
+struct ManifestChunkBuildInput {
+    tenant_id: TenantId,
+    chunk_refs: Vec<ChunkRef>,
+    size_bytes: u64,
+    content_type: String,
+    encryption_profile_id: EncryptionProfileId,
+    key_policy_id: KeyPolicyId,
+    metadata_visibility: VisibilityMode,
+    content_encryption_suite: String,
+    key_wrapping_suite: String,
+    wrapped_object_keys: Vec<WrappedObjectKeyRecord>,
+    server_visible_metadata: BTreeMap<String, String>,
+    encrypted_client_metadata: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteObjectRequest {
     pub tenant_id: TenantId,
@@ -2144,50 +2160,166 @@ impl DistributionService {
                 "complete multipart requires at least one uploaded part",
             ));
         }
-
-        let mut expected_numbers = BTreeSet::new();
-        let mut assembled = Vec::new();
-        for part in &request.parts {
-            expected_numbers.insert(part.part_number);
-            let meta = self
-                .read_encrypted_json::<MultipartPartRecord>(
-                    &request.tenant_id,
-                    MULTIPART_SESSIONS_STORE,
-                    &format!(
-                        "part-meta-{}",
-                        multipart_part_store_key(&request.upload_id, part.part_number)
-                    ),
-                )?
-                .ok_or_else(|| {
-                    ApiError::new(
-                        ApiErrorCategory::NotFound,
-                        "multipart_not_found",
-                        "multipart part metadata not found",
-                    )
-                })?;
-            if meta.etag != part.etag {
-                return Err(ApiError::new(
-                    ApiErrorCategory::Conflict,
-                    "multipart_conflict",
-                    "multipart part ETag does not match stored ciphertext part",
-                ));
-            }
-            let bytes = self
-                .read_encrypted_bytes(
-                    &request.tenant_id,
-                    MULTIPART_PARTS_STORE,
-                    &multipart_part_store_key(&request.upload_id, part.part_number),
-                )?
-                .ok_or_else(|| {
-                    ApiError::new(
-                        ApiErrorCategory::NotFound,
-                        "multipart_not_found",
-                        "multipart part ciphertext not found",
-                    )
-                })?;
-            assembled.extend_from_slice(&bytes);
+        if session.payload_plaintext {
+            return Err(ApiError::new(
+                ApiErrorCategory::Unsupported,
+                "unsupported_plaintext_mode",
+                "multipart trusted-edge plaintext uploads require streaming encryption support",
+            ));
         }
 
+        let mut expected_numbers = BTreeSet::new();
+        let mut previous_part_number = None;
+        let mut chunk_refs = Vec::new();
+        let mut pending_chunk = Vec::with_capacity(FIXED_CHUNK_SIZE);
+        let mut next_chunk_index = 0u32;
+        let mut next_chunk_offset = 0u64;
+
+        for part in &request.parts {
+            if previous_part_number
+                .map(|previous| part.part_number <= previous)
+                .unwrap_or(false)
+            {
+                return Err(ApiError::new(
+                    ApiErrorCategory::Conflict,
+                    "invalid_part_order",
+                    "complete multipart parts must be listed in strictly ascending part order",
+                ));
+            }
+            previous_part_number = Some(part.part_number);
+            expected_numbers.insert(part.part_number);
+            let bytes =
+                self.multipart_part_ciphertext(&request.tenant_id, &request.upload_id, part)?;
+            collect_fixed_chunk_refs(
+                &bytes,
+                &mut pending_chunk,
+                &mut chunk_refs,
+                &mut next_chunk_index,
+                &mut next_chunk_offset,
+            )?;
+        }
+        flush_fixed_chunk_ref(
+            &mut pending_chunk,
+            &mut chunk_refs,
+            &mut next_chunk_index,
+            &mut next_chunk_offset,
+        )?;
+        if chunk_refs.is_empty() {
+            return Err(ApiError::new(
+                ApiErrorCategory::Validation,
+                "zero_sized_manifest",
+                "complete multipart produced an empty object",
+            ));
+        }
+
+        let bucket = self.require_bucket(&request.tenant_id, &session.bucket)?;
+        let existing = self
+            .alpha
+            .resolve(
+                auth,
+                ResolveRequest {
+                    tenant_id: request.tenant_id.clone(),
+                    namespace: bucket.namespace.clone(),
+                    path: session.key.clone(),
+                    at_revision: None,
+                    if_revision: None,
+                },
+            )
+            .ok()
+            .filter(|resolved| !resolved.tombstone);
+        if existing.is_some() {
+            self.ensure_object_mutation_unlocked(
+                &request.tenant_id,
+                &bucket.bucket,
+                &session.key,
+                false,
+                auth,
+            )?;
+        }
+        let existing_revision = existing.as_ref().map(|resolved| resolved.revision);
+        let manifest = build_manifest_from_chunk_refs(ManifestChunkBuildInput {
+            tenant_id: request.tenant_id.clone(),
+            chunk_refs,
+            size_bytes: next_chunk_offset,
+            content_type: session.content_type.clone(),
+            encryption_profile_id: session.encryption_profile_id.clone(),
+            key_policy_id: session.key_policy_id.clone(),
+            metadata_visibility: session.metadata_visibility,
+            content_encryption_suite: session.content_encryption_suite.clone(),
+            key_wrapping_suite: session.key_wrapping_suite.clone(),
+            wrapped_object_keys: session.wrapped_object_keys.clone(),
+            server_visible_metadata: session.server_visible_metadata.clone(),
+            encrypted_client_metadata: session.encrypted_client_metadata.clone(),
+        })?;
+        let manifest_cid = manifest.manifest_cid();
+        let atomic_bind = Some(AtomicBindRequest {
+            namespace: bucket.namespace.clone(),
+            path: session.key.clone(),
+            if_revision: existing_revision,
+            metadata: session.server_visible_metadata.clone(),
+            ttl_ms: None,
+            signed_record_b64: self.sign_namespace_record(&NamespaceMutationRecord {
+                version: 1,
+                tenant_id: request.tenant_id.clone(),
+                namespace: bucket.namespace.clone(),
+                path: session.key.clone(),
+                kind: NamespaceMutationKind::Bind,
+                target_cid: Some(manifest_cid.clone()),
+                if_revision: existing_revision,
+                ttl_ms: None,
+                metadata: session.server_visible_metadata.clone(),
+                issued_at_ms: now_ms(),
+            })?,
+        });
+        let init = self.alpha.put_init(
+            auth,
+            PutInitRequest {
+                tenant_id: request.tenant_id.clone(),
+                manifest,
+                idempotency_key: format!("complete-init-{}", session.idempotency_key),
+                encryption_profile_id: session.encryption_profile_id.clone(),
+                key_policy_id: session.key_policy_id.clone(),
+                metadata_visibility: session.metadata_visibility,
+                storage_class: session.storage_class.clone(),
+                atomic_bind,
+            },
+        )?;
+
+        let mut pending_chunk = Vec::with_capacity(FIXED_CHUNK_SIZE);
+        let mut next_chunk_index = 0u32;
+        let mut next_chunk_offset = 0u64;
+        for part in &request.parts {
+            let bytes =
+                self.multipart_part_ciphertext(&request.tenant_id, &request.upload_id, part)?;
+            upload_fixed_chunks(
+                &self.alpha,
+                auth,
+                &request.tenant_id,
+                &init.session_id,
+                &bytes,
+                &mut pending_chunk,
+                &mut next_chunk_index,
+                &mut next_chunk_offset,
+            )?;
+        }
+        flush_fixed_chunk_upload(
+            &self.alpha,
+            auth,
+            &request.tenant_id,
+            &init.session_id,
+            &mut pending_chunk,
+            &mut next_chunk_index,
+            &mut next_chunk_offset,
+        )?;
+        let committed = self.alpha.put_commit(
+            auth,
+            PutCommitRequest {
+                tenant_id: request.tenant_id.clone(),
+                session_id: init.session_id,
+                manifest_cid: manifest_cid.clone(),
+                idempotency_key: format!("complete-{}", session.idempotency_key),
+            },
+        )?;
         session.completed = true;
         self.write_encrypted_json(
             &request.tenant_id,
@@ -2195,30 +2327,15 @@ impl DistributionService {
             &request.upload_id,
             &session,
         )?;
-        let response = self.put_object(
-            auth,
-            PutObjectRequest {
-                tenant_id: request.tenant_id.clone(),
-                bucket: session.bucket.clone(),
-                key: session.key.clone(),
-                access_profile: session.access_profile,
-                payload_plaintext: session.payload_plaintext,
-                content_type: session.content_type.clone(),
-                encryption_profile_id: session.encryption_profile_id.clone(),
-                key_policy_id: session.key_policy_id.clone(),
-                metadata_visibility: session.metadata_visibility,
-                content_encryption_suite: session.content_encryption_suite.clone(),
-                key_wrapping_suite: session.key_wrapping_suite.clone(),
-                wrapped_object_keys: session.wrapped_object_keys.clone(),
-                server_visible_metadata: session.server_visible_metadata.clone(),
-                encrypted_client_metadata: session.encrypted_client_metadata.clone(),
-                storage_class: session.storage_class.clone(),
-                idempotency_key: format!("complete-{}", session.idempotency_key),
-            },
-            &assembled,
-        )?;
         self.cleanup_multipart(&request.tenant_id, &request.upload_id, &expected_numbers)?;
-        Ok(response)
+        Ok(PutObjectResponse {
+            bucket: bucket.bucket,
+            key: session.key,
+            object_cid: committed.object_cid.clone(),
+            manifest_cid,
+            etag: committed.object_cid,
+            event_seq: committed.event_seq,
+        })
     }
 
     pub fn abort_multipart_upload(
@@ -2671,6 +2788,59 @@ impl DistributionService {
             .into_iter()
             .filter(|part| part.upload_id == upload_id)
             .collect())
+    }
+
+    fn multipart_part_ciphertext(
+        &self,
+        tenant_id: &TenantId,
+        upload_id: &str,
+        part: &CompletedMultipartPart,
+    ) -> Result<Vec<u8>, ApiError> {
+        let part_key = multipart_part_store_key(upload_id, part.part_number);
+        let meta = self
+            .read_encrypted_json::<MultipartPartRecord>(
+                tenant_id,
+                MULTIPART_SESSIONS_STORE,
+                &format!("part-meta-{part_key}"),
+            )?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCategory::NotFound,
+                    "multipart_not_found",
+                    "multipart part metadata not found",
+                )
+            })?;
+        if meta.upload_id != upload_id || meta.part_number != part.part_number {
+            return Err(ApiError::new(
+                ApiErrorCategory::Conflict,
+                "multipart_conflict",
+                "multipart part metadata does not match the requested upload session",
+            ));
+        }
+        if meta.etag != part.etag {
+            return Err(ApiError::new(
+                ApiErrorCategory::Conflict,
+                "multipart_conflict",
+                "multipart part ETag does not match stored ciphertext part",
+            ));
+        }
+        let bytes = self
+            .read_encrypted_bytes(tenant_id, MULTIPART_PARTS_STORE, &part_key)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ApiErrorCategory::NotFound,
+                    "multipart_not_found",
+                    "multipart part ciphertext not found",
+                )
+            })?;
+        if meta.length != bytes.len() as u64 || cid_from_bytes(&bytes) != part.etag {
+            return Err(ApiError::new(
+                ApiErrorCategory::Conflict,
+                "multipart_conflict",
+                "multipart part ciphertext does not match stored metadata",
+            ));
+        }
+        Ok(bytes)
     }
 
     fn cleanup_multipart(
@@ -3201,13 +3371,30 @@ fn build_manifest(input: ManifestBuildInput) -> Result<Manifest, ApiError> {
             content_encoding: chunk.content_encoding.clone(),
         })
         .collect::<Vec<_>>();
+    build_manifest_from_chunk_refs(ManifestChunkBuildInput {
+        tenant_id: input.tenant_id,
+        chunk_refs,
+        size_bytes: input.ciphertext.len() as u64,
+        content_type: input.content_type,
+        encryption_profile_id: input.encryption_profile_id,
+        key_policy_id: input.key_policy_id,
+        metadata_visibility: input.metadata_visibility,
+        content_encryption_suite: input.content_encryption_suite,
+        key_wrapping_suite: input.key_wrapping_suite,
+        wrapped_object_keys: input.wrapped_object_keys,
+        server_visible_metadata: input.server_visible_metadata,
+        encrypted_client_metadata: input.encrypted_client_metadata,
+    })
+}
+
+fn build_manifest_from_chunk_refs(input: ManifestChunkBuildInput) -> Result<Manifest, ApiError> {
     let manifest = Manifest {
         version: 1,
         tenant_id: input.tenant_id,
-        logical_size: input.ciphertext.len() as u64,
-        stored_size: input.ciphertext.len() as u64,
+        logical_size: input.size_bytes,
+        stored_size: input.size_bytes,
         chunker: "fixed-1m".to_string(),
-        chunk_refs,
+        chunk_refs: input.chunk_refs,
         content_type: input.content_type,
         created_at_ms: now_ms(),
         encryption_descriptor: EncryptionDescriptor {
@@ -3223,6 +3410,180 @@ fn build_manifest(input: ManifestBuildInput) -> Result<Manifest, ApiError> {
     };
     manifest.validate()?;
     Ok(manifest)
+}
+
+fn collect_fixed_chunk_refs(
+    bytes: &[u8],
+    pending_chunk: &mut Vec<u8>,
+    chunk_refs: &mut Vec<ChunkRef>,
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let capacity = FIXED_CHUNK_SIZE - pending_chunk.len();
+        let take = capacity.min(remaining.len());
+        pending_chunk.extend_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        if pending_chunk.len() == FIXED_CHUNK_SIZE {
+            append_fixed_chunk_ref(
+                pending_chunk,
+                chunk_refs,
+                next_chunk_index,
+                next_chunk_offset,
+            )?;
+            pending_chunk.clear();
+        }
+    }
+    Ok(())
+}
+
+fn flush_fixed_chunk_ref(
+    pending_chunk: &mut Vec<u8>,
+    chunk_refs: &mut Vec<ChunkRef>,
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    if pending_chunk.is_empty() {
+        return Ok(());
+    }
+    append_fixed_chunk_ref(
+        pending_chunk,
+        chunk_refs,
+        next_chunk_index,
+        next_chunk_offset,
+    )?;
+    pending_chunk.clear();
+    Ok(())
+}
+
+fn append_fixed_chunk_ref(
+    bytes: &[u8],
+    chunk_refs: &mut Vec<ChunkRef>,
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    let chunk_ref = fixed_chunk_ref(*next_chunk_index, *next_chunk_offset, bytes);
+    chunk_refs.push(chunk_ref);
+    advance_fixed_chunk_cursor(bytes, next_chunk_index, next_chunk_offset)
+}
+
+fn upload_fixed_chunks(
+    alpha: &AlphaService,
+    auth: &AuthContext,
+    tenant_id: &TenantId,
+    session_id: &str,
+    bytes: &[u8],
+    pending_chunk: &mut Vec<u8>,
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    let mut remaining = bytes;
+    while !remaining.is_empty() {
+        let capacity = FIXED_CHUNK_SIZE - pending_chunk.len();
+        let take = capacity.min(remaining.len());
+        pending_chunk.extend_from_slice(&remaining[..take]);
+        remaining = &remaining[take..];
+        if pending_chunk.len() == FIXED_CHUNK_SIZE {
+            put_fixed_chunk(
+                alpha,
+                auth,
+                tenant_id,
+                session_id,
+                pending_chunk,
+                next_chunk_index,
+                next_chunk_offset,
+            )?;
+            pending_chunk.clear();
+        }
+    }
+    Ok(())
+}
+
+fn flush_fixed_chunk_upload(
+    alpha: &AlphaService,
+    auth: &AuthContext,
+    tenant_id: &TenantId,
+    session_id: &str,
+    pending_chunk: &mut Vec<u8>,
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    if pending_chunk.is_empty() {
+        return Ok(());
+    }
+    put_fixed_chunk(
+        alpha,
+        auth,
+        tenant_id,
+        session_id,
+        pending_chunk,
+        next_chunk_index,
+        next_chunk_offset,
+    )?;
+    pending_chunk.clear();
+    Ok(())
+}
+
+fn put_fixed_chunk(
+    alpha: &AlphaService,
+    auth: &AuthContext,
+    tenant_id: &TenantId,
+    session_id: &str,
+    bytes: &[u8],
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    let chunk_ref = fixed_chunk_ref(*next_chunk_index, *next_chunk_offset, bytes);
+    alpha.put_chunk(
+        auth,
+        PutChunkRequest {
+            tenant_id: tenant_id.clone(),
+            session_id: session_id.to_string(),
+            chunk_index: chunk_ref.chunk_index,
+            chunk_cid: chunk_ref.cid,
+            chunk_offset: chunk_ref.offset,
+            chunk_length: chunk_ref.stored_len,
+            content_encoding: chunk_ref.content_encoding,
+        },
+        bytes,
+    )?;
+    advance_fixed_chunk_cursor(bytes, next_chunk_index, next_chunk_offset)
+}
+
+fn fixed_chunk_ref(chunk_index: u32, offset: u64, bytes: &[u8]) -> ChunkRef {
+    ChunkRef {
+        chunk_index,
+        cid: cid_from_bytes(bytes),
+        offset,
+        logical_len: bytes.len() as u64,
+        stored_len: bytes.len() as u64,
+        content_encoding: "identity".to_string(),
+    }
+}
+
+fn advance_fixed_chunk_cursor(
+    bytes: &[u8],
+    next_chunk_index: &mut u32,
+    next_chunk_offset: &mut u64,
+) -> Result<(), ApiError> {
+    *next_chunk_index = (*next_chunk_index).checked_add(1).ok_or_else(|| {
+        ApiError::new(
+            ApiErrorCategory::Validation,
+            "object_too_large",
+            "multipart object has too many chunks",
+        )
+    })?;
+    *next_chunk_offset = (*next_chunk_offset)
+        .checked_add(bytes.len() as u64)
+        .ok_or_else(|| {
+            ApiError::new(
+                ApiErrorCategory::Validation,
+                "object_too_large",
+                "multipart object size overflows supported range",
+            )
+        })?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4393,6 +4754,14 @@ mod tests {
             )
             .unwrap();
 
+        let first_payload = vec![b'a'; FIXED_CHUNK_SIZE - 2];
+        let second_payload = b"bbbbb".to_vec();
+        let third_payload = vec![b'c'; FIXED_CHUNK_SIZE + 7];
+        let mut expected_payload = Vec::new();
+        expected_payload.extend_from_slice(&first_payload);
+        expected_payload.extend_from_slice(&second_payload);
+        expected_payload.extend_from_slice(&third_payload);
+
         let part1 = service
             .upload_part(
                 &auth,
@@ -4401,7 +4770,7 @@ mod tests {
                     upload_id: created.upload_id.clone(),
                     part_number: 1,
                 },
-                b"cipher",
+                &first_payload,
             )
             .unwrap();
         let part2 = service
@@ -4412,7 +4781,18 @@ mod tests {
                     upload_id: created.upload_id.clone(),
                     part_number: 2,
                 },
-                b"text",
+                &second_payload,
+            )
+            .unwrap();
+        let part3 = service
+            .upload_part(
+                &auth,
+                UploadPartRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    upload_id: created.upload_id.clone(),
+                    part_number: 3,
+                },
+                &third_payload,
             )
             .unwrap();
 
@@ -4430,6 +4810,10 @@ mod tests {
                         CompletedMultipartPart {
                             part_number: 2,
                             etag: part2.etag,
+                        },
+                        CompletedMultipartPart {
+                            part_number: 3,
+                            etag: part3.etag,
                         },
                     ],
                 },
@@ -4453,7 +4837,8 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(get.body, b"ciphertext");
+        assert_eq!(get.body, expected_payload);
+        assert_eq!(get.head.content_length, (FIXED_CHUNK_SIZE as u64 * 2) + 10);
     }
 
     #[test]
