@@ -15,7 +15,7 @@ spec:
       serviceAccountName: hsp-object-lock-worker
       containers:
         - name: worker
-          image: ghcr.io/example/hsp/hsp-s3:0.1.0
+          image: ghcr.io/example/hsp/hsp-s3@sha256:0000000000000000000000000000000000000000000000000000000000000103
           args: ["worker", "object-lock"]
           env:
             - name: HSP_ROOT_DIR

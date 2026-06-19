@@ -1,6 +1,4 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
-use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -21,7 +19,9 @@ use hsp_crypto::{
     StoredEnvelope, DEFAULT_EDGE_SIGNING_SECRET_LITERALS, MIN_RUNTIME_SECRET_BYTES,
 };
 use hsp_path::{canonical_path, segment_prefix_matches};
-use hsp_service::{AlphaConfig, AlphaService, ServiceMetricSnapshot, StructuredLogRecord};
+use hsp_service::{
+    AlphaConfig, AlphaService, ServiceMetricSnapshot, StoreBackend, StructuredLogRecord,
+};
 use http::HeaderMap;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -537,6 +537,7 @@ pub struct DistributionService {
     alpha: AlphaService,
     object_kms: LocalDevKms,
     store_kms: Box<dyn KmsProvider>,
+    store: StoreBackend,
     issuer_registry: IssuerRegistry,
     namespace_signing_key: SigningKey,
     namespace_signing_key_id: String,
@@ -565,6 +566,10 @@ impl DistributionService {
             ));
         }
 
+        let store = StoreBackend::from_config(
+            config.alpha.root_dir.clone(),
+            &config.alpha.storage_backend,
+        )?;
         let alpha = AlphaService::new(config.alpha.clone(), kms.clone())?
             .with_issuer_registry(issuer_registry.clone());
         let store_kms: Box<dyn KmsProvider> = if let Some(aws) = config.aws_kms.clone() {
@@ -581,6 +586,7 @@ impl DistributionService {
             alpha,
             object_kms: kms,
             store_kms,
+            store,
             issuer_registry,
             namespace_signing_key,
             namespace_signing_key_id,
@@ -938,6 +944,7 @@ impl DistributionService {
                 mode: None,
                 updated_at_ms: now_ms(),
             });
+        self.ensure_retention_update_allowed(&record, immutable_until_ms, mode.as_deref(), auth)?;
         record.immutable_until_ms = immutable_until_ms;
         record.mode = mode;
         record.updated_at_ms = now_ms();
@@ -977,6 +984,9 @@ impl DistributionService {
                 mode: None,
                 updated_at_ms: now_ms(),
             });
+        if record.legal_hold && !legal_hold {
+            self.require_admin_repair(auth, "legal_hold_active")?;
+        }
         record.legal_hold = legal_hold;
         record.updated_at_ms = now_ms();
         self.write_encrypted_json(
@@ -1945,6 +1955,13 @@ impl DistributionService {
             .ok()
             .filter(|resolved| !resolved.tombstone)
             .map(|resolved| resolved.revision);
+        self.ensure_object_mutation_unlocked(
+            &request.tenant_id,
+            &destination_bucket.bucket,
+            &destination_key,
+            false,
+            auth,
+        )?;
         let target_cid = source.target_cid.ok_or_else(|| {
             ApiError::new(
                 ApiErrorCategory::NotFound,
@@ -2386,6 +2403,13 @@ impl DistributionService {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string)
             .unwrap_or_else(|| hex_sha256(binding.body));
+        if payload_hash != "UNSIGNED-PAYLOAD" && payload_hash != hex_sha256(binding.body) {
+            return Err(ApiError::new(
+                ApiErrorCategory::Auth,
+                "invalid_sigv4",
+                "x-amz-content-sha256 does not match request body",
+            ));
+        }
         let canonical = canonical_sigv4_request(
             binding.method,
             binding.raw_path,
@@ -2579,9 +2603,8 @@ impl DistributionService {
 
     fn list_all_access_keys(&self) -> Result<Vec<SigV4AccessKeyRecord>, ApiError> {
         let mut records = Vec::new();
-        for tenant_dir in tenant_dirs(self.config.alpha.root_dir.join(DISTRIBUTION_METADATA_STORE))?
-        {
-            let tenant_id = TenantId(tenant_dir.0);
+        for tenant in self.store.list_child_dirs(DISTRIBUTION_METADATA_STORE)? {
+            let tenant_id = TenantId(decode_tenant_store_dir(&tenant).unwrap_or(tenant));
             records.extend(
                 self.list_encrypted_json::<SigV4AccessKeyRecord>(
                     &tenant_id,
@@ -2746,6 +2769,59 @@ impl DistributionService {
                 Ok(())
             }
         }
+    }
+
+    fn require_admin_repair(&self, auth: &AuthContext, code: &str) -> Result<(), ApiError> {
+        if auth
+            .claims
+            .ops
+            .iter()
+            .any(|scope| matches!(scope, CapabilityScope::AdminRepair))
+        {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            ApiErrorCategory::Policy,
+            code,
+            "admin.repair scope is required for this lock operation",
+        ))
+    }
+
+    fn ensure_retention_update_allowed(
+        &self,
+        current: &ObjectLockRecord,
+        new_immutable_until_ms: Option<u64>,
+        new_mode: Option<&str>,
+        auth: &AuthContext,
+    ) -> Result<(), ApiError> {
+        let Some(current_until) = current.immutable_until_ms else {
+            return Ok(());
+        };
+        if now_ms() >= current_until {
+            return Ok(());
+        }
+
+        let shortens_or_clears = new_immutable_until_ms
+            .map(|new_until| new_until < current_until)
+            .unwrap_or(true);
+        let changes_active_mode = current.mode.as_deref() != new_mode;
+        if !shortens_or_clears && !changes_active_mode {
+            return Ok(());
+        }
+
+        if current
+            .mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("compliance"))
+        {
+            return Err(ApiError::new(
+                ApiErrorCategory::Conflict,
+                "lock_conflict",
+                "active compliance retention cannot be shortened or cleared",
+            ));
+        }
+
+        self.require_admin_repair(auth, "lock_conflict")
     }
 
     fn ensure_object_mutation_unlocked(
@@ -2980,7 +3056,7 @@ impl DistributionService {
     }
 
     fn ensure_store_roots(&self) -> Result<(), ApiError> {
-        for store_kind in [
+        let store_kinds = [
             BUCKET_REGISTRY_STORE,
             DISTRIBUTION_METADATA_STORE,
             MULTIPART_SESSIONS_STORE,
@@ -2992,12 +3068,8 @@ impl DistributionService {
             WEBSITE_STORE,
             REPLICATION_STORE,
             WORKER_CURSOR_STORE,
-        ] {
-            fs::create_dir_all(self.config.alpha.root_dir.join(store_kind)).map_err(|error| {
-                ApiError::new(ApiErrorCategory::Storage, "mkdir_failed", error.to_string())
-            })?;
-        }
-        Ok(())
+        ];
+        self.store.ensure_store_roots(&store_kinds)
     }
 
     fn write_encrypted_bytes(
@@ -3046,23 +3118,9 @@ impl DistributionService {
         tenant_id: &TenantId,
         store_kind: &str,
     ) -> Result<Vec<T>, ApiError> {
-        let tenant_root = self
-            .config
-            .alpha
-            .root_dir
-            .join(store_kind)
-            .join(tenant_store_dir(tenant_id));
-        if !tenant_root.exists() {
-            return Ok(Vec::new());
-        }
         let mut items = Vec::new();
-        for entry in fs::read_dir(tenant_root).map_err(storage_read_error)? {
-            let entry = entry.map_err(storage_read_error)?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let bytes = fs::read(&path).map_err(storage_read_error)?;
+        let prefix = format!("{}/{}/", store_kind, tenant_store_dir(tenant_id));
+        for bytes in self.store.list_values(&prefix)? {
             let envelope: StoredEnvelope =
                 serde_json::from_slice(&bytes).map_err(storage_deserialize_error)?;
             let plaintext = self
@@ -3084,11 +3142,12 @@ impl DistributionService {
         store_kind: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if !path.exists() {
+        let Some(bytes) = self
+            .store
+            .read(&self.store_key(tenant_id, store_kind, key))?
+        else {
             return Ok(None);
-        }
-        let bytes = fs::read(path).map_err(storage_read_error)?;
+        };
         let envelope: StoredEnvelope =
             serde_json::from_slice(&bytes).map_err(storage_deserialize_error)?;
         self.store_kms
@@ -3104,14 +3163,9 @@ impl DistributionService {
         key: &str,
         envelope: &StoredEnvelope,
     ) -> Result<(), ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                ApiError::new(ApiErrorCategory::Storage, "mkdir_failed", error.to_string())
-            })?;
-        }
         let bytes = serde_json::to_vec_pretty(envelope).map_err(storage_serialize_error)?;
-        fs::write(path, bytes).map_err(storage_write_error)
+        self.store
+            .write(&self.store_key(tenant_id, store_kind, key), &bytes)
     }
 
     fn delete_store_key(
@@ -3120,20 +3174,17 @@ impl DistributionService {
         store_kind: &str,
         key: &str,
     ) -> Result<(), ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if path.exists() {
-            fs::remove_file(path).map_err(storage_write_error)?;
-        }
-        Ok(())
+        self.store
+            .delete(&self.store_key(tenant_id, store_kind, key))
     }
 
-    fn store_path(&self, tenant_id: &TenantId, store_kind: &str, key: &str) -> PathBuf {
-        self.config
-            .alpha
-            .root_dir
-            .join(store_kind)
-            .join(tenant_store_dir(tenant_id))
-            .join(store_file_name(key))
+    fn store_key(&self, tenant_id: &TenantId, store_kind: &str, key: &str) -> String {
+        format!(
+            "{}/{}/{}",
+            store_kind,
+            tenant_store_dir(tenant_id),
+            store_file_name(key)
+        )
     }
 }
 
@@ -3725,24 +3776,6 @@ fn store_file_name(key: &str) -> String {
     format!("{}.json.enc", hex_sha256(key.as_bytes()))
 }
 
-fn tenant_dirs(root: PathBuf) -> Result<Vec<(String, PathBuf)>, ApiError> {
-    if !root.exists() {
-        return Ok(Vec::new());
-    }
-    let mut tenants = Vec::new();
-    for entry in fs::read_dir(root).map_err(storage_read_error)? {
-        let entry = entry.map_err(storage_read_error)?;
-        if entry.path().is_dir() {
-            tenants.push((
-                decode_tenant_store_dir(&entry.file_name().to_string_lossy())
-                    .unwrap_or_else(|| entry.file_name().to_string_lossy().to_string()),
-                entry.path(),
-            ));
-        }
-    }
-    Ok(tenants)
-}
-
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3774,29 +3807,15 @@ fn storage_deserialize_error(error: impl std::fmt::Display) -> ApiError {
     )
 }
 
-fn storage_read_error(error: impl std::fmt::Display) -> ApiError {
-    ApiError::new(
-        ApiErrorCategory::Storage,
-        "store_read_failed",
-        error.to_string(),
-    )
-}
-
-fn storage_write_error(error: impl std::fmt::Display) -> ApiError {
-    ApiError::new(
-        ApiErrorCategory::Storage,
-        "store_write_failed",
-        error.to_string(),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::{fs, path::PathBuf};
 
     use hsp_auth::IssuerRecord;
+    use hsp_service::StorageBackendConfig;
     use http::HeaderValue;
 
     static NEXT_TEMP_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -3830,6 +3849,7 @@ mod tests {
                     authority: "localhost".to_string(),
                     gateway_base_url: "https://localhost/v1".to_string(),
                     root_dir: root,
+                    storage_backend: StorageBackendConfig::Filesystem,
                     native_port: 443,
                     server_instance_id: "test".to_string(),
                 },
@@ -4642,6 +4662,116 @@ mod tests {
     }
 
     #[test]
+    fn legal_hold_cannot_be_cleared_without_admin_repair() {
+        let service = service();
+        let auth = auth();
+        service
+            .create_bucket(&auth, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        put_test_object(
+            &service,
+            &auth,
+            "media",
+            "lock/object.bin",
+            "lock-clear-put",
+        );
+        service
+            .put_object_legal_hold(
+                &auth,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                "lock/object.bin",
+                true,
+            )
+            .unwrap();
+
+        let error = service
+            .put_object_legal_hold(
+                &auth,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                "lock/object.bin",
+                false,
+            )
+            .expect_err("ordinary writer must not clear legal hold");
+        assert_eq!(error.code, "legal_hold_active");
+    }
+
+    #[test]
+    fn active_retention_cannot_be_shortened_without_admin_repair() {
+        let service = service();
+        let auth = auth();
+        service
+            .create_bucket(&auth, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        put_test_object(
+            &service,
+            &auth,
+            "media",
+            "retained/object.bin",
+            "retention-put",
+        );
+        let retain_until = now_ms().saturating_add(60_000);
+        service
+            .put_object_retention(
+                &auth,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                "retained/object.bin",
+                Some(retain_until),
+                Some("governance".to_string()),
+            )
+            .unwrap();
+
+        let error = service
+            .put_object_retention(
+                &auth,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                "retained/object.bin",
+                Some(retain_until - 1),
+                Some("governance".to_string()),
+            )
+            .expect_err("ordinary writer must not shorten active retention");
+        assert_eq!(error.code, "lock_conflict");
+    }
+
+    #[test]
+    fn copy_object_respects_destination_legal_hold() {
+        let service = service();
+        let auth = auth();
+        service
+            .create_bucket(&auth, TenantId("tenant-alpha".to_string()), "media")
+            .unwrap();
+        put_test_object(&service, &auth, "media", "source.bin", "copy-lock-source");
+        put_test_object(&service, &auth, "media", "dest.bin", "copy-lock-dest");
+        service
+            .put_object_legal_hold(
+                &auth,
+                TenantId("tenant-alpha".to_string()),
+                "media",
+                "dest.bin",
+                true,
+            )
+            .unwrap();
+
+        let error = service
+            .copy_object(
+                &auth,
+                CopyObjectRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    source_bucket: "media".to_string(),
+                    source_key: "source.bin".to_string(),
+                    destination_bucket: "media".to_string(),
+                    destination_key: "dest.bin".to_string(),
+                    idempotency_key: "copy-lock".to_string(),
+                },
+            )
+            .expect_err("CopyObject must not overwrite a destination under legal hold");
+        assert_eq!(error.code, "legal_hold_active");
+    }
+
+    #[test]
     fn bucket_name_rejects_percent_decoded_slash() {
         let service = service();
         let auth = auth();
@@ -4659,8 +4789,8 @@ mod tests {
     fn store_paths_do_not_collapse_distinct_keys() {
         let service = service();
         let tenant = TenantId("tenant-alpha".to_string());
-        let slash = service.store_path(&tenant, ACL_STORE, "object-media-a/b");
-        let underscore = service.store_path(&tenant, ACL_STORE, "object-media-a_b");
+        let slash = service.store_key(&tenant, ACL_STORE, "object-media-a/b");
+        let underscore = service.store_key(&tenant, ACL_STORE, "object-media-a_b");
         assert_ne!(slash, underscore);
     }
 
@@ -4736,5 +4866,58 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "invalid_sigv4");
         assert!(error.message.contains("duplicate signed header"));
+    }
+
+    #[test]
+    fn header_sigv4_rejects_payload_hash_mismatch() {
+        let service = service();
+        register_sigv4_key(&service);
+        let request_date = amz_date_from_epoch_ms(now_ms());
+        let scope_date = &request_date[..8];
+        let payload_hash = hex_sha256(b"different-body");
+        let signed_headers = vec![
+            "host".to_string(),
+            "x-amz-content-sha256".to_string(),
+            "x-amz-date".to_string(),
+        ];
+        let mut headers = HeaderMap::new();
+        headers.insert("host", HeaderValue::from_static("s3.example.test"));
+        headers.insert("x-amz-date", HeaderValue::from_str(&request_date).unwrap());
+        headers.insert(
+            "x-amz-content-sha256",
+            HeaderValue::from_str(&payload_hash).unwrap(),
+        );
+        let canonical = canonical_sigv4_request(
+            "PUT",
+            "/media/object.bin",
+            "",
+            &headers,
+            &signed_headers,
+            &payload_hash,
+        )
+        .unwrap();
+        let credential_scope = format!("{scope_date}/auto/s3/aws4_request");
+        let string_to_sign = sigv4_string_to_sign(&request_date, &credential_scope, &canonical);
+        let signature =
+            sigv4_signature("secret", scope_date, "auto", "s3", &string_to_sign).unwrap();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_str(&format!(
+                "AWS4-HMAC-SHA256 Credential=AKIA_TEST/{credential_scope}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}"
+            ))
+            .unwrap(),
+        );
+
+        let error = service
+            .authenticate_sigv4(&HttpRequestBinding {
+                method: "PUT",
+                raw_path: "/media/object.bin",
+                raw_query: "",
+                headers: &headers,
+                body: b"actual-body",
+            })
+            .expect_err("header SigV4 must bind the signed payload hash to the body");
+        assert_eq!(error.code, "invalid_sigv4");
+        assert!(error.message.contains("x-amz-content-sha256"));
     }
 }

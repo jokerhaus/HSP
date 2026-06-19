@@ -21,10 +21,12 @@ use hsp_distribution::{
     canonical_bucket_name, canonical_object_key_name, AccessProfile, DistributionConfig,
     DistributionService, GetObjectRequest, HttpRequestBinding,
 };
-use hsp_service::AlphaConfig;
+use hsp_service::{AlphaConfig, StorageBackendConfig};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+
+const MAX_CDN_REQUEST_BODY_BYTES: usize = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CdnServerConfig {
@@ -92,6 +94,7 @@ fn build_distribution_service(config: &CdnServerConfig) -> Result<DistributionSe
                 authority: config.authority.clone(),
                 gateway_base_url: config.gateway_base_url.clone(),
                 root_dir: config.root_dir.clone(),
+                storage_backend: StorageBackendConfig::Filesystem,
                 native_port: 443,
                 server_instance_id: config.server_instance_id.clone(),
             },
@@ -128,7 +131,7 @@ async fn handle_request(
     let uri = uri.0;
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or_default().to_string();
-    let body = match to_bytes(request.into_body(), usize::MAX).await {
+    let body = match to_bytes(request.into_body(), MAX_CDN_REQUEST_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => {
             return api_error_response(ApiError::new(
@@ -349,7 +352,7 @@ async fn dispatch_request(
             method,
             namespace_cache_key(&auth.claims.tenant_id, &bucket, &key, prefer_plaintext),
             false,
-            range.is_none(),
+            false,
             || async {
                 state.service.get_object(
                     auth,
@@ -767,9 +770,13 @@ impl From<ApiError> for ErrorBody {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use base64::Engine as _;
     use hsp_auth::IssuerRecord;
     use tower::ServiceExt;
+
+    static NEXT_TEMP_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
     async fn route_without_auth_is_rejected() {
@@ -789,6 +796,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn get_with_body_is_rejected_before_auth() {
+        let app = router(Arc::new(CdnState {
+            service: Arc::new(build_test_service()),
+            cache: Arc::new(Mutex::new(BTreeMap::new())),
+            immutable_cid_ttl_sec: 3600,
+            namespace_ttl_sec: 5,
+        }));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/cid/test")
+                    .body(Body::from("unexpected"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
@@ -921,7 +948,11 @@ mod tests {
     }
 
     fn build_test_service() -> DistributionService {
-        let root = std::env::temp_dir().join(format!("hsp-cdn-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "hsp-cdn-test-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let signing_key = SigningKey::from_bytes(&[33u8; 32]);
         let verifying_key = signing_key.verifying_key();

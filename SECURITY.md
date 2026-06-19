@@ -37,7 +37,7 @@ Mandatory security gates for release candidates:
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit`
-- `GOTOOLCHAIN=go1.25.10+auto go work sync`
+- `GOTOOLCHAIN=go1.25.11+auto go work sync`
 - `go test ./sdk/go/... ./cli/hspctl/...`
 - `govulncheck ./...` in `sdk/go` and `cli/hspctl`
 - `cargo run -p hsp-conformance`

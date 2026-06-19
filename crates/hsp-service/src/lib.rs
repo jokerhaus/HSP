@@ -1,6 +1,4 @@
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -29,6 +27,11 @@ use hsp_crypto::{
 use hsp_path::canonical_path;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
+mod store;
+pub use store::{
+    storage_backend_config_from_env, S3StorageBackendConfig, StorageBackendConfig, StoreBackend,
+};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AlphaConfig {
     pub authority: String,
@@ -36,12 +39,14 @@ pub struct AlphaConfig {
     pub root_dir: PathBuf,
     pub native_port: u16,
     pub server_instance_id: String,
+    pub storage_backend: StorageBackendConfig,
 }
 
 #[derive(Debug)]
 pub struct AlphaService {
     config: AlphaConfig,
     kms: LocalDevKms,
+    store: StoreBackend,
     policy_engine: PolicyEngine,
     issuer_registry: Option<IssuerRegistry>,
     observability: ObservabilityState,
@@ -209,9 +214,11 @@ struct SelectorResolution {
 
 impl AlphaService {
     pub fn new(config: AlphaConfig, kms: LocalDevKms) -> Result<Self, ApiError> {
+        let store = StoreBackend::from_config(config.root_dir.clone(), &config.storage_backend)?;
         let service = Self {
             config,
             kms,
+            store,
             policy_engine: PolicyEngine::new(),
             issuer_registry: None,
             observability: ObservabilityState::default(),
@@ -245,7 +252,7 @@ impl AlphaService {
 
     pub fn readiness(&self) -> ReadinessReport {
         ReadinessReport {
-            ready: self.config.root_dir.exists(),
+            ready: self.store.ready(),
             kms_provider: "local-dev-kms".to_string(),
             encrypted_store_roots: vec![
                 "chunks".to_string(),
@@ -380,6 +387,7 @@ impl AlphaService {
                 .map(|bind| bind.namespace.as_str()),
             path: request.atomic_bind.as_ref().map(|bind| bind.path.as_str()),
             content_size: Some(request.manifest.stored_size),
+            storage_class: Some(&request.storage_class),
             key_policy_id: Some(&request.key_policy_id),
             encryption_profile_id: Some(&request.encryption_profile_id),
             metadata_visibility: Some(request.metadata_visibility),
@@ -545,6 +553,22 @@ impl AlphaService {
             ));
         }
 
+        if request.chunk_length != ciphertext_chunk.len() as u64 {
+            return Err(ApiError::new(
+                ApiErrorCategory::Validation,
+                "chunk_length_mismatch",
+                "PUT_CHUNK chunk_length must match the actual ciphertext payload length",
+            ));
+        }
+
+        if ciphertext_chunk.len() as u64 > self.info().limits.max_chunk_size {
+            return Err(ApiError::new(
+                ApiErrorCategory::Validation,
+                "chunk_too_large",
+                "ciphertext chunk exceeds max_chunk_size",
+            ));
+        }
+
         let chunk_subject = format!("{}:{}", request.session_id, request.chunk_index);
         let meta = AuthRequestMeta {
             operation: OperationName::PutChunk,
@@ -552,7 +576,8 @@ impl AlphaService {
             subject: &chunk_subject,
             namespace: None,
             path: None,
-            content_size: Some(request.chunk_length),
+            content_size: Some(ciphertext_chunk.len() as u64),
+            storage_class: Some(&session.storage_class),
             key_policy_id: Some(&session.manifest.encryption_descriptor.key_policy_id),
             encryption_profile_id: Some(
                 &session.manifest.encryption_descriptor.encryption_profile_id,
@@ -640,6 +665,7 @@ impl AlphaService {
                 .map(|bind| bind.namespace.as_str()),
             path: session.atomic_bind.as_ref().map(|bind| bind.path.as_str()),
             content_size: Some(session.manifest.stored_size),
+            storage_class: Some(&session.storage_class),
             key_policy_id: Some(&session.manifest.encryption_descriptor.key_policy_id),
             encryption_profile_id: Some(
                 &session.manifest.encryption_descriptor.encryption_profile_id,
@@ -805,6 +831,7 @@ impl AlphaService {
             namespace: resolution.namespace.as_deref(),
             path: resolution.path.as_deref(),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -878,6 +905,7 @@ impl AlphaService {
             namespace: resolution.namespace.as_deref(),
             path: resolution.path.as_deref(),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -1047,6 +1075,7 @@ impl AlphaService {
             namespace: Some(&namespace),
             path: Some(&path),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -1125,6 +1154,7 @@ impl AlphaService {
             namespace: Some(&namespace),
             path: prefix.as_deref(),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -1230,25 +1260,40 @@ impl AlphaService {
             ));
         }
 
-        let meta = AuthRequestMeta {
-            operation: OperationName::Subscribe,
-            tenant_id: &request.tenant_id,
-            subject: "events",
-            namespace: request
-                .filters
-                .first()
-                .and_then(|filter| filter.namespace_prefix.as_deref()),
-            path: request
-                .filters
-                .first()
-                .and_then(|filter| filter.path_exact.as_deref()),
-            content_size: None,
-            key_policy_id: None,
-            encryption_profile_id: None,
-            metadata_visibility: None,
-            idempotency_key: None,
-        };
-        self.authorize(auth, &meta)?;
+        if request.filters.is_empty() {
+            let meta = AuthRequestMeta {
+                operation: OperationName::Subscribe,
+                tenant_id: &request.tenant_id,
+                subject: "events",
+                namespace: None,
+                path: None,
+                content_size: None,
+                storage_class: None,
+                key_policy_id: None,
+                encryption_profile_id: None,
+                metadata_visibility: None,
+                idempotency_key: None,
+            };
+            self.authorize(auth, &meta)?;
+        } else {
+            for (index, filter) in request.filters.iter().enumerate() {
+                let subject = format!("events:filter:{index}");
+                let meta = AuthRequestMeta {
+                    operation: OperationName::Subscribe,
+                    tenant_id: &request.tenant_id,
+                    subject: &subject,
+                    namespace: filter.namespace_prefix.as_deref(),
+                    path: filter.path_exact.as_deref(),
+                    content_size: None,
+                    storage_class: None,
+                    key_policy_id: None,
+                    encryption_profile_id: None,
+                    metadata_visibility: None,
+                    idempotency_key: None,
+                };
+                self.authorize(auth, &meta)?;
+            }
+        }
 
         let latest_next_seq = self.next_read_event_seq(&request.tenant_id)?;
         let next_seq = if let Some(cursor) = &request.cursor {
@@ -1505,6 +1550,7 @@ impl AlphaService {
             namespace: Some(&namespace),
             path: Some(&path),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -1654,6 +1700,7 @@ impl AlphaService {
             namespace: Some(&namespace),
             path: Some(&path),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -2129,17 +2176,8 @@ impl AlphaService {
         store_kind: &str,
         key: &str,
     ) -> Result<(), ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if path.exists() {
-            fs::remove_file(path).map_err(|error| {
-                ApiError::new(
-                    ApiErrorCategory::Storage,
-                    "store_delete_failed",
-                    error.to_string(),
-                )
-            })?;
-        }
-        Ok(())
+        self.store
+            .delete(&self.store_key(tenant_id, store_kind, key))
     }
 
     fn manifest_record(
@@ -2174,7 +2212,7 @@ impl AlphaService {
     }
 
     fn chunk_exists(&self, tenant_id: &TenantId, cid: &str) -> bool {
-        self.store_path(tenant_id, "chunks", cid).exists()
+        self.store.exists(&self.store_key(tenant_id, "chunks", cid))
     }
 
     fn write_encrypted_bytes(
@@ -2267,18 +2305,12 @@ impl AlphaService {
         store_kind: &str,
         key: &str,
     ) -> Result<Option<Vec<u8>>, ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if !path.exists() {
+        let Some(bytes) = self
+            .store
+            .read(&self.store_key(tenant_id, store_kind, key))?
+        else {
             return Ok(None);
-        }
-
-        let bytes = fs::read(path).map_err(|error| {
-            ApiError::new(
-                ApiErrorCategory::Storage,
-                "store_read_failed",
-                error.to_string(),
-            )
-        })?;
+        };
         let envelope: StoredEnvelope = serde_json::from_slice(&bytes).map_err(|error| {
             ApiError::new(
                 ApiErrorCategory::Storage,
@@ -2312,13 +2344,6 @@ impl AlphaService {
         key: &str,
         envelope: &StoredEnvelope,
     ) -> Result<(), ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                ApiError::new(ApiErrorCategory::Storage, "mkdir_failed", error.to_string())
-            })?;
-        }
-
         let bytes = serde_json::to_vec_pretty(envelope).map_err(|error| {
             ApiError::new(
                 ApiErrorCategory::Storage,
@@ -2326,13 +2351,8 @@ impl AlphaService {
                 error.to_string(),
             )
         })?;
-        fs::write(path, bytes).map_err(|error| {
-            ApiError::new(
-                ApiErrorCategory::Storage,
-                "store_write_failed",
-                error.to_string(),
-            )
-        })
+        self.store
+            .write(&self.store_key(tenant_id, store_kind, key), &bytes)
     }
 
     fn create_envelope(
@@ -2342,13 +2362,6 @@ impl AlphaService {
         key: &str,
         envelope: &StoredEnvelope,
     ) -> Result<bool, ApiError> {
-        let path = self.store_path(tenant_id, store_kind, key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|error| {
-                ApiError::new(ApiErrorCategory::Storage, "mkdir_failed", error.to_string())
-            })?;
-        }
-
         let bytes = serde_json::to_vec_pretty(envelope).map_err(|error| {
             ApiError::new(
                 ApiErrorCategory::Storage,
@@ -2356,36 +2369,12 @@ impl AlphaService {
                 error.to_string(),
             )
         })?;
-        let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-            Err(error) => {
-                return Err(ApiError::new(
-                    ApiErrorCategory::Storage,
-                    "store_create_failed",
-                    error.to_string(),
-                ))
-            }
-        };
-        file.write_all(&bytes).map_err(|error| {
-            ApiError::new(
-                ApiErrorCategory::Storage,
-                "store_write_failed",
-                error.to_string(),
-            )
-        })?;
-        file.sync_all().map_err(|error| {
-            ApiError::new(
-                ApiErrorCategory::Storage,
-                "store_sync_failed",
-                error.to_string(),
-            )
-        })?;
-        Ok(true)
+        self.store
+            .create(&self.store_key(tenant_id, store_kind, key), &bytes)
     }
 
     fn ensure_store_roots(&self) -> Result<(), ApiError> {
-        for store_kind in [
+        let store_kinds = [
             "chunks",
             "manifests",
             "namespace-current",
@@ -2396,21 +2385,17 @@ impl AlphaService {
             "idempotency",
             "replay",
             "events",
-        ] {
-            fs::create_dir_all(self.config.root_dir.join(store_kind)).map_err(|error| {
-                ApiError::new(ApiErrorCategory::Storage, "mkdir_failed", error.to_string())
-            })?;
-        }
-
-        Ok(())
+        ];
+        self.store.ensure_store_roots(&store_kinds)
     }
 
-    fn store_path(&self, tenant_id: &TenantId, store_kind: &str, key: &str) -> PathBuf {
-        self.config
-            .root_dir
-            .join(store_kind)
-            .join(tenant_store_dir(tenant_id))
-            .join(store_file_name(key))
+    fn store_key(&self, tenant_id: &TenantId, store_kind: &str, key: &str) -> String {
+        format!(
+            "{}/{}/{}",
+            store_kind,
+            tenant_store_dir(tenant_id),
+            store_file_name(key)
+        )
     }
 
     fn idempotency_key(&self, tenant_id: &TenantId, op: &str, value: &str) -> String {
@@ -2508,6 +2493,7 @@ pub fn alpha_service_with_kms_seed(
             root_dir: root_dir.as_ref().to_path_buf(),
             native_port: 443,
             server_instance_id: "hsp-alpha-dev".to_string(),
+            storage_backend: StorageBackendConfig::Filesystem,
         },
         kms,
     )
@@ -2553,6 +2539,7 @@ fn prometheus_escape(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::fs;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
@@ -2560,7 +2547,7 @@ mod tests {
         ApiErrorCategory, CapabilityClaims, CapabilityScope, ChannelBindingProof, ChunkRef,
         EncryptionDescriptor, EncryptionProfileId, GetPreference, GetRequest, KeyPolicyId,
         Manifest, ObjectSelector, PutChunkRequest, PutCommitRequest, PutInitRequest,
-        VisibilityMode, WrappedObjectKeyRecord,
+        SubscribeFilter, SubscribeRequest, VisibilityMode, WrappedObjectKeyRecord,
     };
 
     static NEXT_TEMP_ROOT_ID: AtomicU64 = AtomicU64::new(1);
@@ -2579,8 +2566,8 @@ mod tests {
     fn store_paths_do_not_collapse_distinct_keys() {
         let service = alpha_service_with_kms_seed(temp_root(), test_kms_seed()).unwrap();
         let tenant = TenantId("tenant/a".to_string());
-        let slash = service.store_path(&tenant, "manifests", "folder/object");
-        let underscore = service.store_path(&tenant, "manifests", "folder_object");
+        let slash = service.store_key(&tenant, "manifests", "folder/object");
+        let underscore = service.store_key(&tenant, "manifests", "folder_object");
         assert_ne!(slash, underscore);
     }
 
@@ -2888,6 +2875,81 @@ mod tests {
     }
 
     #[test]
+    fn put_chunk_rejects_actual_length_mismatch() {
+        let service = service();
+        let actual_chunk = b"ciphertext-with-extra-bytes";
+        let chunk_cid = hsp_core::cid_from_bytes(actual_chunk);
+        let manifest = manifest_with_chunk(chunk_cid.clone());
+        let auth = auth_context();
+        let init = service
+            .put_init(
+                &auth,
+                PutInitRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    manifest,
+                    idempotency_key: "idem-length-init".to_string(),
+                    encryption_profile_id: EncryptionProfileId("public-e2ee-v1".to_string()),
+                    key_policy_id: KeyPolicyId("policy-default".to_string()),
+                    metadata_visibility: VisibilityMode::Split,
+                    storage_class: "hot".to_string(),
+                    atomic_bind: None,
+                },
+            )
+            .unwrap();
+        let chunk_auth = AuthContext {
+            claims: CapabilityClaims {
+                jti: Some("jti-length-chunk".to_string()),
+                ..auth.claims.clone()
+            },
+            channel_binding: auth.channel_binding.clone(),
+        };
+
+        let error = service
+            .put_chunk(
+                &chunk_auth,
+                PutChunkRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    session_id: init.session_id,
+                    chunk_index: 0,
+                    chunk_cid,
+                    chunk_offset: 0,
+                    chunk_length: 11,
+                    content_encoding: "identity".to_string(),
+                },
+                actual_chunk,
+            )
+            .expect_err("actual ciphertext length must match declared chunk_length");
+
+        assert_eq!(error.code, "chunk_length_mismatch");
+    }
+
+    #[test]
+    fn put_init_rejects_disallowed_storage_class() {
+        let service = service();
+        let chunk_cid = hsp_core::cid_from_bytes(b"ciphertext!");
+        let manifest = manifest_with_chunk(chunk_cid);
+        let auth = auth_context();
+
+        let error = service
+            .put_init(
+                &auth,
+                PutInitRequest {
+                    tenant_id: TenantId("tenant-alpha".to_string()),
+                    manifest,
+                    idempotency_key: "idem-cold-init".to_string(),
+                    encryption_profile_id: EncryptionProfileId("public-e2ee-v1".to_string()),
+                    key_policy_id: KeyPolicyId("policy-default".to_string()),
+                    metadata_visibility: VisibilityMode::Split,
+                    storage_class: "cold".to_string(),
+                    atomic_bind: None,
+                },
+            )
+            .expect_err("capability storage_classes must constrain PUT_INIT storage_class");
+
+        assert_eq!(error.code, "storage_class_mismatch");
+    }
+
+    #[test]
     fn idempotent_put_init_returns_same_response() {
         let service = service();
         let chunk_cid = hsp_core::cid_from_bytes(b"ciphertext!");
@@ -2963,5 +3025,49 @@ mod tests {
         assert!(readiness
             .encrypted_store_roots
             .contains(&"replay".to_string()));
+    }
+
+    #[test]
+    fn subscribe_authorizes_every_filter() {
+        let service = service();
+        let base = auth_context();
+        let scoped = AuthContext {
+            claims: CapabilityClaims {
+                ops: vec![CapabilityScope::Subscribe],
+                namespace_prefix: Some("media".to_string()),
+                path_prefix: None,
+                jti: None,
+                ..base.claims
+            },
+            channel_binding: base.channel_binding,
+        };
+        let request = SubscribeRequest {
+            tenant_id: TenantId("tenant-alpha".to_string()),
+            filters: vec![
+                SubscribeFilter {
+                    namespace_prefix: Some("media".to_string()),
+                    path_exact: None,
+                    object_cid: None,
+                    event_type: None,
+                    tenant_scope: None,
+                },
+                SubscribeFilter {
+                    namespace_prefix: Some("private".to_string()),
+                    path_exact: None,
+                    object_cid: None,
+                    event_type: None,
+                    tenant_scope: None,
+                },
+            ],
+            cursor: None,
+            from_seq: None,
+            heartbeat_ms: None,
+            batch_max: None,
+        };
+
+        let error = service
+            .subscribe_start(&scoped, &request)
+            .expect_err("every subscribe filter must be independently authorized");
+        assert_eq!(error.code, "namespace_scope_mismatch");
     }
 }

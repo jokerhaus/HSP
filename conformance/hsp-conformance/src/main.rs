@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         authority: "localhost".to_string(),
         gateway_base_url: "https://localhost".to_string(),
         root_dir: root.clone(),
+        storage_backend: hsp_service::StorageBackendConfig::Filesystem,
         server_instance_id: "conformance-s3".to_string(),
         capability_audience: "hsp-s3".to_string(),
         immutable_cid_ttl_sec: 3600,

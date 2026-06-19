@@ -2,7 +2,7 @@ module github.com/loxar/hsp/sdk/go
 
 go 1.25.0
 
-toolchain go1.25.10
+toolchain go1.25.11
 
 require (
 	github.com/fxamacker/cbor/v2 v2.7.0

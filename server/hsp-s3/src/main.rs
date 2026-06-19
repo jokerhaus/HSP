@@ -8,6 +8,7 @@ use hsp_crypto::{
 };
 use hsp_distribution::SigV4AccessKeyRecord;
 use hsp_s3::{run_s3_server, S3ServerConfig};
+use hsp_service::storage_backend_config_from_env;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -39,6 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         gateway_base_url: env::var("HSP_GATEWAY_BASE_URL")
             .unwrap_or_else(|_| "https://localhost".to_string()),
         root_dir,
+        storage_backend: storage_backend_config_from_env()?,
         server_instance_id: env::var("HSP_SERVER_INSTANCE_ID")
             .unwrap_or_else(|_| "hsp-s3-dev".to_string()),
         capability_audience: env::var("HSP_CAPABILITY_AUDIENCE")

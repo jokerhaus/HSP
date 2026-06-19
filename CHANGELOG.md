@@ -1,5 +1,65 @@
 # Changelog
 
+## v0.1.2 - 2026-06-19
+
+Security fix release for the HSP core, S3-like service, CDN edge, CI, and
+release pipeline.
+
+### Security
+
+- Fixed CDN namespace cache-hit authorization bypass by forcing scoped
+  namespace delivery through the shared service authorization path.
+- Fixed native `SUBSCRIBE` filter authorization so every requested filter is
+  independently checked.
+- Fixed upload quota bypass by validating actual ciphertext chunk length
+  against `PUT_CHUNK.chunk_length`, manifest `stored_len`, and chunk limits.
+- Enforced `CapabilityClaims.storage_classes` during upload authorization.
+- Added bounded request-body reads for native, gateway, S3-like, and CDN
+  request paths.
+- Hardened object lock:
+  - ordinary writers can no longer clear legal hold.
+  - active retention cannot be shortened without `admin.repair`.
+  - active compliance retention cannot be shortened or cleared.
+  - `CopyObject` now respects destination legal hold and retention.
+- Fixed header SigV4 body binding by verifying `x-amz-content-sha256` against
+  the received request body.
+- Preserved empty object-key segments in S3 path-style routing.
+- Added a bounded S3 backing-store response reader.
+- Removed the direct `rustls-pemfile` dependency and replaced it with a minimal
+  certificate-only PEM parser for custom CA bundles.
+- Updated Go release baseline to `go1.25.11`.
+- Pinned CI GitHub Actions and security tools to immutable SHAs or explicit
+  versions.
+- Pinned Docker base images by digest and converted Kubernetes examples to
+  digest-form workload images.
+
+### Tests
+
+- Added regression coverage for storage-class policy, chunk length mismatch,
+  multi-filter subscription authorization, object-lock bypass attempts,
+  `CopyObject` destination lock enforcement, SigV4 payload mismatch, CDN body
+  rejection, and S3 path-style empty key segments.
+
+### Upgrade Notes
+
+- Operators must use Go `1.25.11+` for SDK/CLI validation.
+- Release bundles now require a preinstalled pinned Syft binary instead of
+  downloading and executing a remote installer.
+- Kubernetes example image digests are placeholders and must be replaced with
+  the actual published image digests for the target release.
+
+## v0.1.1 - 2026-06-01
+
+Security-hardening and owner-operated production readiness release.
+
+### Security
+
+- Required explicit runtime KMS and edge signing secrets.
+- Rejected known legacy default runtime secrets.
+- Tightened S3/CDN scoped authorization and edge token behavior.
+- Added durable encrypted replay markers.
+- Added release-evidence and internal owner-operated sign-off docs.
+
 ## v0.1.0 - 2026-04-23
 
 First public HSP release.

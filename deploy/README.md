@@ -25,3 +25,14 @@ These services are intended to share the same encrypted storage root, issuer
 registry, namespace-authority signer, and workload identity used by the HSP
 core services. The public profile remains ciphertext-only at the storage and
 edge layers.
+
+## Image Digest Policy
+
+The Kubernetes manifests use digest-form image references. The checked-in
+`ghcr.io/example/...@sha256:000...` values are placeholders for release
+templates; replace them with the actual image digests produced by your registry
+before applying the manifests.
+
+Do not deploy mutable tag-only references such as `:latest` or `:0.1.x` in
+production. Keep the image digest, SBOM, and release review bundle together for
+the deployed commit.

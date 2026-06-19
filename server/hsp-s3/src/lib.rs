@@ -23,10 +23,12 @@ use hsp_distribution::{
     LifecycleRule, ListObjectsRequest, PutObjectRequest, ReplicationConfig, SigV4AccessKeyRecord,
     UploadPartRequest, WebsiteConfig,
 };
-use hsp_service::AlphaConfig;
+use hsp_service::{AlphaConfig, StorageBackendConfig};
 use quick_xml::{de::from_str as from_xml_str, se::to_string as to_xml_string};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+
+const MAX_S3_REQUEST_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct S3ServerConfig {
@@ -34,6 +36,7 @@ pub struct S3ServerConfig {
     pub authority: String,
     pub gateway_base_url: String,
     pub root_dir: PathBuf,
+    pub storage_backend: StorageBackendConfig,
     pub server_instance_id: String,
     pub capability_audience: String,
     pub immutable_cid_ttl_sec: u64,
@@ -81,6 +84,7 @@ fn build_distribution_service(config: &S3ServerConfig) -> Result<DistributionSer
                 authority: config.authority.clone(),
                 gateway_base_url: config.gateway_base_url.clone(),
                 root_dir: config.root_dir.clone(),
+                storage_backend: config.storage_backend.clone(),
                 native_port: 443,
                 server_instance_id: config.server_instance_id.clone(),
             },
@@ -113,7 +117,7 @@ async fn handle_request(
     let uri = uri.0;
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or_default().to_string();
-    let body = match to_bytes(request.into_body(), usize::MAX).await {
+    let body = match to_bytes(request.into_body(), MAX_S3_REQUEST_BODY_BYTES).await {
         Ok(body) => body,
         Err(error) => {
             return api_error_response(ApiError::new(
@@ -207,20 +211,22 @@ fn resolve_bucket_and_key(
         }
     }
 
-    let segments = uri
-        .path()
-        .trim_start_matches('/')
-        .split('/')
-        .filter(|segment| !segment.is_empty())
-        .collect::<Vec<_>>();
-    if segments.is_empty() {
+    let path = uri.path().trim_start_matches('/');
+    if path.is_empty() {
         return Ok(ResolvedRoute {
             bucket: None,
             key: None,
         });
     }
-    let bucket = segments[0].to_string();
-    let key = (segments.len() > 1).then(|| segments[1..].join("/"));
+    let (bucket, key) = path
+        .split_once('/')
+        .map(|(bucket, key)| {
+            (
+                bucket.to_string(),
+                (!key.is_empty()).then(|| key.to_string()),
+            )
+        })
+        .unwrap_or_else(|| (path.to_string(), None));
     Ok(ResolvedRoute {
         bucket: Some(bucket),
         key,
@@ -1594,9 +1600,13 @@ impl From<hsp_distribution::ReplicationStatus> for ReplicationStatusXml {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicU64, Ordering};
+
     use axum::body::Body;
     use base64::Engine as _;
     use tower::ServiceExt;
+
+    static NEXT_TEMP_ROOT_ID: AtomicU64 = AtomicU64::new(1);
 
     #[tokio::test]
     async fn root_without_auth_is_rejected() {
@@ -1611,8 +1621,25 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
     }
 
+    #[test]
+    fn path_style_routing_preserves_empty_key_segments() {
+        let route = resolve_bucket_and_key(
+            &HeaderMap::new(),
+            &"/media/a//b".parse::<Uri>().unwrap(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(route.bucket.as_deref(), Some("media"));
+        assert_eq!(route.key.as_deref(), Some("a//b"));
+    }
+
     fn build_test_service() -> DistributionService {
-        let root = std::env::temp_dir().join(format!("hsp-s3-test-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "hsp-s3-test-{}-{}",
+            std::process::id(),
+            NEXT_TEMP_ROOT_ID.fetch_add(1, Ordering::Relaxed)
+        ));
         let _ = std::fs::remove_dir_all(&root);
         let signing_key = SigningKey::from_bytes(&[21u8; 32]);
         let verifying_key = signing_key.verifying_key();
@@ -1638,6 +1665,7 @@ mod tests {
             authority: "localhost".to_string(),
             gateway_base_url: "https://localhost".to_string(),
             root_dir: root,
+            storage_backend: StorageBackendConfig::Filesystem,
             server_instance_id: "test".to_string(),
             capability_audience: "hsp-s3".to_string(),
             immutable_cid_ttl_sec: 3600,

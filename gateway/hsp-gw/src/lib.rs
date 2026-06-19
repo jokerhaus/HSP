@@ -27,7 +27,9 @@ use hsp_core::{
     HeadRequest, ListRequest, ObjectSelector, PutChunkRequest, PutCommitRequest, PutInitRequest,
     ResolveRequest, SubscribeEnvelopeKind, SubscribeFilter, SubscribeRequest, UnbindRequest,
 };
-use hsp_service::{AlphaConfig, AlphaService};
+use hsp_service::{AlphaConfig, AlphaService, StorageBackendConfig};
+
+const GATEWAY_JSON_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GatewayBetaConfig {
@@ -97,6 +99,7 @@ pub async fn spawn_gateway_beta_server(
                 authority: config.authority.clone(),
                 gateway_base_url,
                 root_dir: config.root_dir.clone(),
+                storage_backend: StorageBackendConfig::Filesystem,
                 native_port: config.native_port,
                 server_instance_id: config.server_instance_id.clone(),
             },
@@ -225,7 +228,9 @@ where
         }
         (&Method::POST, "/v1/uploads") => {
             let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
-            let body = read_http_body(stream).await.map_err(http_body_error)?;
+            let body = read_http_body(stream, GATEWAY_JSON_BODY_LIMIT_BYTES)
+                .await
+                .map_err(http_body_error)?;
             let request: PutInitRequest = serde_json::from_slice(&body).map_err(bad_json)?;
             let response = state.service.put_init(&auth, request)?;
             Ok(json_response(StatusCode::OK, &response)?)
@@ -360,7 +365,9 @@ where
             if chunk_path.starts_with("/v1/uploads/") && chunk_path.contains("/chunks/") =>
         {
             let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
-            let body = read_http_body(stream).await.map_err(http_body_error)?;
+            let body = read_http_body(stream, state.service.info().limits.max_chunk_size as usize)
+                .await
+                .map_err(http_body_error)?;
             let parts = chunk_path
                 .trim_start_matches("/v1/uploads/")
                 .split("/chunks/")
@@ -410,7 +417,9 @@ where
             if commit_path.starts_with("/v1/uploads/") && commit_path.ends_with(":commit") =>
         {
             let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
-            let body = read_http_body(stream).await.map_err(http_body_error)?;
+            let body = read_http_body(stream, GATEWAY_JSON_BODY_LIMIT_BYTES)
+                .await
+                .map_err(http_body_error)?;
             let mut commit: PutCommitRequest = serde_json::from_slice(&body).map_err(bad_json)?;
             commit.session_id = commit_path
                 .trim_start_matches("/v1/uploads/")
@@ -443,7 +452,9 @@ where
         (&Method::PUT, path) if path.starts_with("/v1/namespaces/") && path.contains("/bind/") => {
             let (namespace, item_path) = split_namespace_operation(path, "/bind/")?;
             let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
-            let body = read_http_body(stream).await.map_err(http_body_error)?;
+            let body = read_http_body(stream, GATEWAY_JSON_BODY_LIMIT_BYTES)
+                .await
+                .map_err(http_body_error)?;
             let mut bind: BindRequest = serde_json::from_slice(&body).map_err(bad_json)?;
             bind.namespace = namespace;
             bind.path = item_path;
@@ -455,7 +466,9 @@ where
         {
             let (namespace, item_path) = split_namespace_operation(path, "/bind/")?;
             let auth = verify_gateway_auth(connection, request.headers(), &state.issuer_registry)?;
-            let body = read_http_body(stream).await.map_err(http_body_error)?;
+            let body = read_http_body(stream, GATEWAY_JSON_BODY_LIMIT_BYTES)
+                .await
+                .map_err(http_body_error)?;
             let mut unbind: UnbindRequest = serde_json::from_slice(&body).map_err(bad_json)?;
             unbind.namespace = namespace;
             unbind.path = item_path;
@@ -602,6 +615,7 @@ fn verify_gateway_auth(
 
 async fn read_http_body<T>(
     stream: &mut h3::server::RequestStream<T, Bytes>,
+    max_body_bytes: usize,
 ) -> Result<Vec<u8>, Box<dyn Error + Send + Sync>>
 where
     T: h3::quic::BidiStream<Bytes>,
@@ -609,7 +623,11 @@ where
     let mut body = Vec::new();
     while let Some(chunk) = stream.recv_data().await? {
         let mut chunk = chunk;
-        body.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+        let remaining = chunk.remaining();
+        if body.len().saturating_add(remaining) > max_body_bytes {
+            return Err("request body exceeds operation limit".into());
+        }
+        body.extend_from_slice(&chunk.copy_to_bytes(remaining));
     }
     Ok(body)
 }

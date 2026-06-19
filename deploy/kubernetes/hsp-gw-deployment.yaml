@@ -15,7 +15,7 @@ spec:
       serviceAccountName: hsp-gw
       containers:
         - name: hsp-gw
-          image: ghcr.io/example/hsp/hsp-gw:0.1.0
+          image: ghcr.io/example/hsp/hsp-gw@sha256:0000000000000000000000000000000000000000000000000000000000000102
           args: ["--profile=public-multi-tenant"]
           env:
             - name: HSP_KMS_SEED

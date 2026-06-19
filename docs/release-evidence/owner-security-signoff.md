@@ -2,10 +2,10 @@
 
 ## Status
 
-- Date: `2026-06-01`
+- Date: `2026-06-19`
 - Scope: owner-operated HSP deployments used by the project owner in first-party projects
 - Decision: accepted for owner-operated production use after local security gates and conformance pass
-- Commit baseline: generated from the release branch merged into `main`
+- Commit baseline: `v0.1.2` security-fix release candidate after local gates pass
 
 ## What This Sign-Off Means
 
@@ -29,6 +29,8 @@ security gates pass and the operator follows the hardened deployment profile.
 - S3/CDN public access must use scoped capability, SigV4/presign, or edge-token
   policy; anonymous access is not the baseline.
 - Release gates in `security-gates.md` must pass for the deployed commit.
+- Kubernetes image references must be replaced with real digest-pinned release
+  images before deployment.
 
 ## Accepted Residual Risk
 

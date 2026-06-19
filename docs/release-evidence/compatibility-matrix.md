@@ -3,7 +3,7 @@
 ## Evidence Source
 
 - Primary source: `cargo run -p hsp-conformance`
-- Date: `2026-06-01`
+- Date: `2026-06-19`
 
 ## Surface Coverage
 
@@ -29,6 +29,13 @@
 | CDN range read | `206` with `Content-Range` | pass |
 | stale namespace binding after rebind | first read after invalidation is `MISS` and returns fresh ciphertext | pass |
 | repeated near-expiry presign replay | valid ciphertext delivery inside allowed window | pass |
+| CDN scoped namespace cache hit | re-authorized through shared service layer | pass |
+| `SUBSCRIBE` with unauthorized second filter | `namespace_scope_mismatch` | pass |
+| chunk length under-reporting | `chunk_length_mismatch` | pass |
+| clearing legal hold without `admin.repair` | `legal_hold_active` | pass |
+| shortening active retention without `admin.repair` | `lock_conflict` | pass |
+| `CopyObject` over locked destination | `legal_hold_active` / `lock_conflict` | pass |
+| header SigV4 payload hash mismatch | `invalid_sigv4` | pass |
 
 ## Measured Local Benchmarks
 

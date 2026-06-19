@@ -1,4 +1,4 @@
-# HSP 100% Completion Status (June 1, 2026)
+# HSP 100% Completion Status (June 19, 2026)
 
 ## Delivered In This Hardening Pass
 
@@ -6,7 +6,10 @@
   - expanded `.github/workflows/ci.yml` with Rust tests, `clippy`, `cargo audit`,
     Go tests, `govulncheck`, black-box conformance, SBOM generation, and PR
     dependency review
-  - normalized Go release baseline to `go1.25.10`
+  - normalized Go release baseline to `go1.25.11`
+  - pinned GitHub Actions and release security tools to immutable SHAs or
+    explicit versions
+  - removed `curl | sh` Syft installation from the release bundle script
 - Conformance and adversarial coverage:
   - widened `hsp-conformance` to cover S3 compatibility smoke:
     - `ListObjectsV2`
@@ -43,16 +46,27 @@
     `delete`, `auth_denied`, `kms_error`, and `integrity_error`
   - tightened chunk ingest integrity so `PUT_CHUNK` rejects ciphertext bytes
     whose computed CID does not match the declared chunk CID
+  - hardened `v0.1.2` security findings:
+    - CDN scoped namespace cache hits are re-authorized through the shared
+      service layer
+    - every `SUBSCRIBE` filter is independently authorized
+    - actual ciphertext chunk length is checked before storage
+    - storage-class capability claims are enforced
+    - object lock blocks legal-hold clearing, retention shortening, and
+      `CopyObject` destination overwrite bypasses
+    - header SigV4 verifies `x-amz-content-sha256` against the request body
+    - request-body buffering is bounded across native, gateway, S3-like, and
+      CDN surfaces
 
 ## Local Verification Baseline
 
 - `cargo test --workspace --all-targets`
 - `cargo clippy --workspace --all-targets -- -D warnings`
 - `env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit`
-- `cd sdk/go && GOTOOLCHAIN=go1.25.10+auto go test ./...`
-- `cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto go test ./...`
-- `cd sdk/go && GOTOOLCHAIN=go1.25.10+auto govulncheck ./...`
-- `cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto govulncheck ./...`
+- `cd sdk/go && GOTOOLCHAIN=go1.25.11+auto go test ./...`
+- `cd cli/hspctl && GOTOOLCHAIN=go1.25.11+auto go test ./...`
+- `cd sdk/go && GOTOOLCHAIN=go1.25.11+auto govulncheck ./...`
+- `cd cli/hspctl && GOTOOLCHAIN=go1.25.11+auto govulncheck ./...`
 - `cargo run -p hsp-conformance`
 
 ## Production Sign-Off Status

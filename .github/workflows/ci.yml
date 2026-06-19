@@ -7,43 +7,47 @@ on:
 permissions:
   contents: read
 
+env:
+  GOVULNCHECK_VERSION: v1.4.0
+  CARGO_AUDIT_VERSION: 0.22.2
+
 jobs:
   dependency-review:
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Dependency review
-        uses: actions/dependency-review-action@v4
+        uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
 
   go:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.work
       - name: Sync Go workspace
-        run: GOTOOLCHAIN=go1.25.10+auto go work sync
+        run: GOTOOLCHAIN=go1.25.11+auto go work sync
       - name: Install govulncheck
-        run: GOTOOLCHAIN=go1.25.10+auto go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: GOTOOLCHAIN=go1.25.11+auto go install "golang.org/x/vuln/cmd/govulncheck@${GOVULNCHECK_VERSION}"
       - name: Go tests
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
-          GOTOOLCHAIN=go1.25.10+auto go test ./sdk/go/... ./cli/hspctl/... | tee "$GITHUB_WORKSPACE/artifacts/go-test.txt"
+          GOTOOLCHAIN=go1.25.11+auto go test ./sdk/go/... ./cli/hspctl/... | tee "$GITHUB_WORKSPACE/artifacts/go-test.txt"
       - name: Go vulnerability check (sdk/go)
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cd sdk/go
-          GOTOOLCHAIN=go1.25.10+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee "$GITHUB_WORKSPACE/artifacts/govulncheck-sdk-go.txt"
+          GOTOOLCHAIN=go1.25.11+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee "$GITHUB_WORKSPACE/artifacts/govulncheck-sdk-go.txt"
       - name: Go vulnerability check (cli/hspctl)
         run: |
           mkdir -p "$GITHUB_WORKSPACE/artifacts"
           cd cli/hspctl
-          GOTOOLCHAIN=go1.25.10+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee "$GITHUB_WORKSPACE/artifacts/govulncheck-hspctl.txt"
+          GOTOOLCHAIN=go1.25.11+auto "$(go env GOPATH)"/bin/govulncheck ./... | tee "$GITHUB_WORKSPACE/artifacts/govulncheck-hspctl.txt"
       - name: Upload Go artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: go-security-reports
           path: |
@@ -54,9 +58,9 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: rustfmt, clippy
       - name: Rust tests
@@ -68,14 +72,14 @@ jobs:
           mkdir -p artifacts
           cargo clippy --workspace --all-targets -- -D warnings | tee artifacts/cargo-clippy.txt
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version "${CARGO_AUDIT_VERSION}" --locked
       - name: Rust audit
         run: |
           mkdir -p artifacts
           env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit | tee artifacts/cargo-audit.txt
       - name: Upload Rust artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: rust-security-reports
           path: |
@@ -86,9 +90,9 @@ jobs:
   conformance:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Run conformance
         run: |
           mkdir -p artifacts
@@ -104,7 +108,7 @@ jobs:
           PY
       - name: Upload conformance artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hsp-conformance-report
           path: artifacts/hsp-conformance-report.json
@@ -112,11 +116,11 @@ jobs:
   sbom:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Prepare artifact directory
         run: mkdir -p artifacts
       - name: Generate SPDX SBOM
-        uses: anchore/sbom-action@v0
+        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0
         with:
           path: .
           format: spdx-json
@@ -124,7 +128,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: hsp-source-sbom
           path: artifacts/hsp-source.spdx.json

@@ -2,7 +2,7 @@ module github.com/loxar/hsp/cli/hspctl
 
 go 1.25.0
 
-toolchain go1.25.10
+toolchain go1.25.11
 
 require github.com/loxar/hsp/sdk/go v0.0.0
 

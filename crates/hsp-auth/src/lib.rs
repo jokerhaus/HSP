@@ -43,6 +43,7 @@ pub struct AuthRequestMeta<'a> {
     pub namespace: Option<&'a str>,
     pub path: Option<&'a str>,
     pub content_size: Option<u64>,
+    pub storage_class: Option<&'a str>,
     pub key_policy_id: Option<&'a KeyPolicyId>,
     pub encryption_profile_id: Option<&'a EncryptionProfileId>,
     pub metadata_visibility: Option<VisibilityMode>,
@@ -86,6 +87,7 @@ pub enum DenialReason {
     NamespaceScopeMismatch,
     PathScopeMismatch,
     ObjectTooLarge,
+    StorageClassMismatch,
     ExpiredToken,
     NotYetValid,
     ReplayDetected,
@@ -106,6 +108,7 @@ impl Display for DenialReason {
             Self::NamespaceScopeMismatch => f.write_str("namespace scope mismatch"),
             Self::PathScopeMismatch => f.write_str("path scope mismatch"),
             Self::ObjectTooLarge => f.write_str("object too large"),
+            Self::StorageClassMismatch => f.write_str("storage class mismatch"),
             Self::ExpiredToken => f.write_str("expired token"),
             Self::NotYetValid => f.write_str("token not yet valid"),
             Self::ReplayDetected => f.write_str("replay detected"),
@@ -215,6 +218,18 @@ impl PolicyEngine {
             }
         }
 
+        if let Some(storage_class) = meta.storage_class {
+            if !auth.claims.storage_classes.is_empty()
+                && !auth
+                    .claims
+                    .storage_classes
+                    .iter()
+                    .any(|allowed| allowed == storage_class)
+            {
+                return Err(DenialReason::StorageClassMismatch);
+            }
+        }
+
         let replay_status = if let Some(jti) = &auth.claims.jti {
             self.replay_cache.observe(
                 meta.tenant_id,
@@ -297,6 +312,7 @@ pub fn denial_to_api_error(reason: DenialReason) -> ApiError {
         }
         DenialReason::PathScopeMismatch => (ApiErrorCategory::Policy, "path_scope_mismatch"),
         DenialReason::ObjectTooLarge => (ApiErrorCategory::Validation, "object_too_large"),
+        DenialReason::StorageClassMismatch => (ApiErrorCategory::Policy, "storage_class_mismatch"),
         DenialReason::ExpiredToken => (ApiErrorCategory::Auth, "token_expired"),
         DenialReason::NotYetValid => (ApiErrorCategory::Auth, "token_not_yet_valid"),
         DenialReason::InvalidSignedRecord => (ApiErrorCategory::Auth, "invalid_signed_record"),
@@ -619,6 +635,7 @@ mod tests {
             namespace: None,
             path: Some("tenant/a/file"),
             content_size: Some(1024),
+            storage_class: Some("hot"),
             key_policy_id: Some(&key_policy),
             encryption_profile_id: Some(&encryption_profile),
             metadata_visibility: Some(VisibilityMode::Split),
@@ -641,6 +658,7 @@ mod tests {
             namespace: None,
             path: Some("tenant/a/file"),
             content_size: None,
+            storage_class: None,
             key_policy_id: None,
             encryption_profile_id: None,
             metadata_visibility: None,
@@ -665,6 +683,7 @@ mod tests {
             namespace: None,
             path: Some("tenant/a/file"),
             content_size: None,
+            storage_class: Some("hot"),
             key_policy_id: Some(&key_policy),
             encryption_profile_id: Some(&encryption_profile),
             metadata_visibility: None,
@@ -695,6 +714,7 @@ mod tests {
             namespace: None,
             path: Some("tenant/a/file"),
             content_size: None,
+            storage_class: Some("hot"),
             key_policy_id: Some(&key_policy),
             encryption_profile_id: Some(&encryption_profile),
             metadata_visibility: None,
@@ -709,6 +729,33 @@ mod tests {
         assert_eq!(
             engine.authorize(&auth, &second),
             Err(DenialReason::ReplayDetected)
+        );
+    }
+
+    #[test]
+    fn disallowed_storage_class_is_rejected() {
+        let engine = PolicyEngine::new();
+        let auth = auth_context();
+        let tenant = TenantId("tenant-alpha".to_string());
+        let key_policy = KeyPolicyId("policy-default".to_string());
+        let encryption_profile = EncryptionProfileId("public-e2ee-v1".to_string());
+        let meta = AuthRequestMeta {
+            operation: OperationName::PutInit,
+            tenant_id: &tenant,
+            subject: "manifest-cid",
+            namespace: None,
+            path: Some("tenant/a/file"),
+            content_size: Some(1024),
+            storage_class: Some("cold"),
+            key_policy_id: Some(&key_policy),
+            encryption_profile_id: Some(&encryption_profile),
+            metadata_visibility: Some(VisibilityMode::Split),
+            idempotency_key: Some("idem-cold"),
+        };
+
+        assert_eq!(
+            engine.authorize(&auth, &meta),
+            Err(DenialReason::StorageClassMismatch)
         );
     }
 

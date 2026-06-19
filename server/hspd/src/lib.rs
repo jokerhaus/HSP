@@ -22,8 +22,10 @@ use hsp_core::{
     ListRequest, PayloadMode, PutChunkRequest, PutCommitRequest, PutInitRequest, ReqHeader,
     ResHeader, ResolveRequest, SubscribeEnvelopeKind, SubscribeRequest, UnbindRequest,
 };
-use hsp_service::{AlphaConfig, AlphaService};
+use hsp_service::{AlphaConfig, AlphaService, StorageBackendConfig};
 use hsp_wire::{read_frame, write_frame, Frame, WireCodecError};
+
+const NATIVE_JSON_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeBetaConfig {
@@ -85,6 +87,7 @@ pub async fn spawn_native_beta_server(
                 authority: config.authority.clone(),
                 gateway_base_url: config.gateway_base_url.clone(),
                 root_dir: config.root_dir.clone(),
+                storage_backend: StorageBackendConfig::Filesystem,
                 native_port: local_addr.port(),
                 server_instance_id: config.server_instance_id.clone(),
             },
@@ -228,7 +231,7 @@ async fn handle_request_stream(
         }
     };
 
-    let body = read_body(&mut recv).await?;
+    let body = read_body(&mut recv, native_body_limit(&state.service, &header)).await?;
     match header.operation {
         hsp_core::OperationName::Info => {
             let info = state.service.info();
@@ -400,11 +403,29 @@ fn verify_auth_frame(
     })
 }
 
-async fn read_body(recv: &mut RecvStream) -> Result<Vec<u8>, WireCodecError> {
+fn native_body_limit(service: &AlphaService, header: &ReqHeader) -> usize {
+    match header.operation {
+        hsp_core::OperationName::Info => 0,
+        hsp_core::OperationName::PutChunk => service.info().limits.max_chunk_size as usize,
+        _ => NATIVE_JSON_BODY_LIMIT_BYTES,
+    }
+}
+
+async fn read_body(
+    recv: &mut RecvStream,
+    max_body_bytes: usize,
+) -> Result<Vec<u8>, WireCodecError> {
     let mut body = Vec::new();
     loop {
         match read_frame(recv).await? {
-            Frame::Data(bytes) => body.extend_from_slice(&bytes),
+            Frame::Data(bytes) => {
+                if body.len().saturating_add(bytes.len()) > max_body_bytes {
+                    return Err(WireCodecError::InvalidFrame(
+                        "request body exceeds operation limit".to_string(),
+                    ));
+                }
+                body.extend_from_slice(&bytes);
+            }
             Frame::End => break,
             frame => {
                 return Err(WireCodecError::InvalidFrame(format!(

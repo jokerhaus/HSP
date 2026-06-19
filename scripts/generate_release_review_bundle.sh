@@ -6,6 +6,10 @@ TIMESTAMP="$(date +"%Y%m%d-%H%M%S")"
 OUT_DIR="${1:-$ROOT_DIR/artifacts/release-review/$TIMESTAMP}"
 LATEST_LINK="$ROOT_DIR/artifacts/release-review/latest"
 LOG_FILE="$OUT_DIR/driver.log"
+GO_TOOLCHAIN="${GO_TOOLCHAIN:-go1.25.11+auto}"
+GOVULNCHECK_VERSION="${GOVULNCHECK_VERSION:-v1.4.0}"
+CARGO_AUDIT_VERSION="${CARGO_AUDIT_VERSION:-0.22.2}"
+export GO_TOOLCHAIN GOVULNCHECK_VERSION CARGO_AUDIT_VERSION
 
 mkdir -p "$OUT_DIR"
 
@@ -37,7 +41,7 @@ ensure_govulncheck() {
   GOVULNCHECK_BIN="$(go env GOPATH)/bin/govulncheck"
   if [[ ! -x "$GOVULNCHECK_BIN" ]]; then
     run_shell_step "install-govulncheck" \
-      'GOTOOLCHAIN=go1.25.10+auto go install golang.org/x/vuln/cmd/govulncheck@latest'
+      'GOTOOLCHAIN="$GO_TOOLCHAIN" go install "golang.org/x/vuln/cmd/govulncheck@$GOVULNCHECK_VERSION"'
   fi
   GOVULNCHECK_BIN="$(go env GOPATH)/bin/govulncheck"
 }
@@ -52,10 +56,8 @@ ensure_syft() {
     return 0
   fi
 
-  mkdir -p "$ROOT_DIR/bin"
-  run_shell_step "install-syft" \
-    "curl -sSfL https://get.anchore.io/syft | sh -s -- -b \"$ROOT_DIR/bin\""
-  SYFT_BIN="$ROOT_DIR/bin/syft"
+  log "syft is required to generate the SBOM; install a pinned Syft release and re-run"
+  return 1
 }
 
 write_summary() {
@@ -159,15 +161,17 @@ ensure_syft
 export ROOT_DIR OUT_DIR GOVULNCHECK_BIN SYFT_BIN
 
 run_step "cargo-fmt-check" cargo fmt --check
-run_shell_step "go-work-sync" 'GOTOOLCHAIN=go1.25.10+auto go work sync'
+run_shell_step "go-work-sync" 'GOTOOLCHAIN="$GO_TOOLCHAIN" go work sync'
 run_step "cargo-test" cargo test --workspace --all-targets
 run_step "cargo-clippy" cargo clippy --workspace --all-targets -- -D warnings
+run_shell_step "install-cargo-audit" \
+  'cargo install cargo-audit --version "$CARGO_AUDIT_VERSION" --locked'
 run_shell_step "cargo-audit" \
   'env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null cargo audit'
 run_shell_step "go-test-sdk" \
-  'cd sdk/go && GOTOOLCHAIN=go1.25.10+auto go test ./...'
+  'cd sdk/go && GOTOOLCHAIN="$GO_TOOLCHAIN" go test ./...'
 run_shell_step "go-test-cli" \
-  'cd cli/hspctl && GOTOOLCHAIN=go1.25.10+auto go test ./...'
+  'cd cli/hspctl && GOTOOLCHAIN="$GO_TOOLCHAIN" go test ./...'
 run_shell_step "govulncheck-sdk" \
   "cd sdk/go && \"$GOVULNCHECK_BIN\" ./..."
 run_shell_step "govulncheck-cli" \
